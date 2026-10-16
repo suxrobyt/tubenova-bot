@@ -1,8 +1,11 @@
-"""TubeNova AI — YouTuberlar uchun bepul Telegram bot (aiogram 3 + Groq API)."""
+"""TubeNova AI — YouTuberlar uchun bepul Telegram bot (aiogram 3 + Groq + Pollinations)."""
 import asyncio
+import json
 import logging
 import os
+import re
 import secrets
+from collections import defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -12,30 +15,39 @@ from aiogram.filters import CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup,
-                           KeyboardButton, Message, ReplyKeyboardMarkup)
-from groq import AsyncGroq
+from aiogram.types import (BufferedInputFile, InlineKeyboardButton,
+                           InlineKeyboardMarkup, KeyboardButton, Message,
+                           ReplyKeyboardMarkup)
 from dotenv import load_dotenv
+from groq import AsyncGroq
+
+import media
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tubenova")
 
-# ---------- Sozlamalar (.env faylidan) ----------
+# ---------- Sozlamalar (Railway Variables yoki .env) ----------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-MODEL = os.getenv("MODEL", "llama-3.3-70b-versatile")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))          # buyurtmalar shu odamga boradi
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")     # @ belgisisiz
-DAILY_Q = int(os.getenv("DAILY_QUESTIONS", "15"))    # kunlik savollar
-DAILY_S = int(os.getenv("DAILY_SERVICES", "3"))      # kunlik xizmatlar
-REF_BONUS = int(os.getenv("REF_BONUS", "2"))         # har bir do'st uchun bonus
+MODEL = os.getenv("MODEL", "openai/gpt-oss-120b")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))           # buyurtmalar shu odamga boradi
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")      # @ belgisisiz
+DAILY_Q = int(os.getenv("DAILY_QUESTIONS", "15"))
+DAILY_S = int(os.getenv("DAILY_SERVICES", "3"))
+REF_BONUS = int(os.getenv("REF_BONUS", "2"))
+# Cheklovsiz foydalanuvchilar: ADMIN_ID + UNLIMITED_IDS (vergul bilan, raqamlar)
+UNLIMITED = {int(x) for x in os.getenv("UNLIMITED_IDS", "").replace(" ", "").split(",") if x.isdigit()}
+if ADMIN_ID:
+    UNLIMITED.add(ADMIN_ID)
 DB = "tubenova.db"
 TZ = ZoneInfo("Asia/Tashkent")
+N = 4  # buyurtmadagi rasm va video soni
 
 ai = AsyncGroq(api_key=GROQ_API_KEY)
 router = Router()
 BOT_USERNAME = ""
+ORDER_LOCKS = defaultdict(asyncio.Lock)
 
 # ---------- Tugmalar ----------
 BTN_QA = "💬 Savol-Javob 24/7"
@@ -46,6 +58,10 @@ BTN_REF = "👥 Do'st taklif qilish"
 BTN_TOS = "📜 Shartlar"
 BTN_HELP = "🆘 Yordam"
 BTN_MAIN = "↩️ Asosiy menyu"
+BTN_V_MAKE = "▶️ Videoni tayyorlash"
+BTN_V_FILES = "📋 Yuborilgan fayllarni ko'rish"
+BTN_V_CANCEL = "❌ Buyurtmani bekor qilish"
+BTN_V_NEW = "🔄 Yangi "
 
 DIRECTIONS = ["🎮 Tiles Hop", "🕺 Coffin Dance", "👽 Alien Dance",
               "👾 Tiles Hop EXE", "🏆 GOLDEN COVER", "🎤 Say The Word", "👀 Wrong Eyes"]
@@ -59,6 +75,13 @@ def kb(rows):
 
 MAIN_KB = kb([[BTN_QA, BTN_CHANNEL], [BTN_VIDEO, BTN_LIMITS],
               [BTN_REF], [BTN_TOS, BTN_HELP]])
+VIDEO_KB = kb([DIRECTIONS[i:i + 2] for i in range(0, len(DIRECTIONS), 2)] + [[BTN_MAIN]])
+
+
+def order_kb(direction: str):
+    name = direction.split(" ", 1)[1]
+    return kb([[BTN_V_MAKE, BTN_V_FILES], [BTN_V_CANCEL, BTN_V_NEW + name], [BTN_MAIN]])
+
 
 # ---------- Kanal xizmatlari ----------
 BASE = ("Sen TubeNova AI — YouTuberlar uchun yordamchisan. Javobni o'zbek tilida "
@@ -67,19 +90,15 @@ BASE = ("Sen TubeNova AI — YouTuberlar uchun yordamchisan. Javobni o'zbek tili
 
 SERVICES = {
     "logo": {
-        "btn": "🎨 Logo",
+        "btn": "🎨 Logo", "design": True,
         "ask": "Logo uchun bitta xabarda yozing:\n1) Kanal nomi?\n2) Yo'nalishi qanday?\n"
-               "3) Qaysi rang va uslub yoqadi? (ixtiyoriy)",
-        "system": BASE + " Foydalanuvchiga YouTube kanal logosi uchun 3 ta konsepsiya ber: "
-                  "har biri uchun shakl, rang palitrasi, shrift va 1 ta tayyor inglizcha "
-                  "AI-rasm prompti (Midjourney/DALL-E uchun).",
+               "3) Qaysi rang va uslub yoqadi? (ixtiyoriy)\n\nLogo rasm sifatida tayyorlanadi.",
     },
     "banner": {
-        "btn": "🖼 Banner",
+        "btn": "🖼 Banner", "design": True,
         "ask": "Banner uchun bitta xabarda yozing:\n1) Kanal nomi?\n2) Yo'nalishi qanday?\n"
-               "3) Bannerda qanday yozuv va rang bo'lsin? (ixtiyoriy)",
-        "system": BASE + " YouTube banner (2560x1440, xavfsiz zona 1546x423) uchun 3 ta "
-                  "maket g'oyasi ber: joylashuv, yozuv, ranglar va inglizcha AI-rasm prompti.",
+               "3) Qaysi rang va uslub yoqadi? (ixtiyoriy)\n\nBanner rasm sifatida tayyorlanadi, "
+               "kanal nomi o'rtasiga yoziladi.",
     },
     "tags": {
         "btn": "🏷 Teglar",
@@ -109,14 +128,25 @@ SERVICE_BY_BTN = {s["btn"]: k for k, s in SERVICES.items()}
 CHANNEL_KB = kb([[SERVICES["logo"]["btn"], SERVICES["banner"]["btn"]],
                  [SERVICES["tags"]["btn"], SERVICES["about"]["btn"]],
                  [SERVICES["analysis"]["btn"]], [BTN_MAIN]])
-VIDEO_KB = kb([DIRECTIONS[i:i + 2] for i in range(0, len(DIRECTIONS), 2)] + [[BTN_MAIN]])
+
+DESIGN_SYSTEM = (
+    "You are an expert logo and YouTube banner designer. From the user's details (any language) "
+    "return ONLY a JSON object, no other text: "
+    '{"name": "<channel name exactly as the user wrote it>", "prompt": "<English image-generation prompt>"}. '
+    "The prompt must describe artwork only: subject, composition, art style, colors, lighting. "
+    "NEVER include any text, letters, words or real brand logos in the artwork. ")
+DESIGN_HINT = {
+    "logo": "Make a LOGO: one centered emblem or mascot icon on a clean simple background with "
+            "generous margin, bold shapes, suitable for a circular crop, polished vector or 3D style.",
+    "banner": "Make a YouTube BANNER background: wide panoramic 16:9 scene, key elements spread to the "
+              "sides, calm empty space in the center for the channel title, rich cinematic colors.",
+}
 
 QA_SYSTEM = BASE + (" Faqat YouTube, kontent yaratish, video tahrirlash va kanal o'stirish "
                     "mavzularida javob ber. Boshqa mavzuda xushmuomalalik bilan YouTube'ga qaytar.")
 
-WELCOME = ("Assalomu alaykum! 👋 TubeNova AI — YouTuberlar uchun bepul yordamchi.\n\n"
-           "Kanal logosi, banner, teglar, tavsif, kanal tahlili va YouTube bo'yicha "
-           "savol-javob — hammasi shu yerda.\n\nQuyidagi tugmalardan tanlang.")
+WELCOME = ("Assalomu alaykum! TubeNova AI yordamchisiga xush kelibsiz.\n\n"
+           "Sizga qanday yordam kerak? Quyidagi tugmalardan tanlang.")
 LIMIT_MSG = ("⏳ Bugungi limit tugadi. Limit har kuni 00:00 da (Toshkent vaqti) yangilanadi.\n"
              "Do'stlaringizni taklif qilib bonus urinishlar oling: «" + BTN_REF + "».")
 TOS_TEXT = ("📜 Foydalanish shartlari\n\n"
@@ -178,7 +208,9 @@ async def get_user(uid: int):
 
 
 async def consume(uid: int, kind: str):
-    """Bitta urinishni sarflaydi. Manba qaytaradi: 'q' | 's' | 'b' | None."""
+    """Bitta urinishni sarflaydi. Manba: 'u' (cheksiz) | 'q' | 's' | 'b' | None."""
+    if uid in UNLIMITED:
+        return "u"
     u = await get_user(uid)
     async with aiosqlite.connect(DB) as db:
         if kind == "q":
@@ -199,6 +231,8 @@ async def consume(uid: int, kind: str):
 
 
 async def refund(uid: int, src: str):
+    if src == "u":
+        return
     col = {"q": "q_used", "s": "s_used"}.get(src)
     async with aiosqlite.connect(DB) as db:
         if col:
@@ -209,11 +243,14 @@ async def refund(uid: int, src: str):
 
 
 # ---------- AI ----------
-async def ask_ai(system: str, prompt: str, max_tokens: int = 1000) -> str:
+async def ask_ai(system: str, prompt: str, max_tokens: int = 2000) -> str:
+    kw = {}
+    if MODEL.startswith("openai/gpt-oss"):
+        kw["extra_body"] = {"reasoning_effort": "low"}  # tez va bo'sh javob chiqmasligi uchun
     r = await ai.chat.completions.create(
         model=MODEL, max_tokens=max_tokens,
         messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": prompt}])
+                  {"role": "user", "content": prompt}], **kw)
     return (r.choices[0].message.content or "").strip()
 
 
@@ -222,7 +259,7 @@ async def send_long(m: Message, text: str, **kw):
         await m.answer(text[i:i + 4000], **kw)
 
 
-async def answer_with_ai(m: Message, kind: str, system: str, prompt: str, max_tokens=1000):
+async def answer_with_ai(m: Message, kind: str, system: str, prompt: str, max_tokens=2000):
     src = await consume(m.from_user.id, kind)
     if not src:
         await m.answer(LIMIT_MSG)
@@ -237,6 +274,86 @@ async def answer_with_ai(m: Message, kind: str, system: str, prompt: str, max_to
         return False
     await send_long(m, text or "Javob bo'sh chiqdi, iltimos qayta yozing.")
     return True
+
+
+def parse_json(text: str) -> dict:
+    mt = re.search(r"\{.*\}", text, re.S)
+    try:
+        return json.loads(mt.group(0)) if mt else {}
+    except Exception:
+        return {}
+
+
+async def make_design(m: Message, kind: str, text: str) -> bool:
+    """Logo yoki banner RASMini yaratadi (matn emas)."""
+    src = await consume(m.from_user.id, "s")
+    if not src:
+        await m.answer(LIMIT_MSG)
+        return False
+    await m.answer("🎨 Tayyorlanmoqda, 30–60 soniya kuting...")
+    try:
+        await m.bot.send_chat_action(m.chat.id, "upload_photo")
+        raw = await ask_ai(DESIGN_SYSTEM + DESIGN_HINT[kind], text[:1500], 2000)
+        info = parse_json(raw)
+        name = str(info.get("name") or text.strip().splitlines()[0])[:40].strip()
+        prompt = str(info.get("prompt") or text)
+        if kind == "logo":
+            img = await media.fetch_image(prompt, 1024, 1024)
+            data, fname = media.to_bytes(img, "PNG"), "logo.png"
+        else:
+            img = await media.fetch_image(prompt, 1280, 720)
+            img = media.banner_with_text(img, name)
+            data, fname = media.to_bytes(img, "JPEG"), "banner.jpg"
+    except Exception:
+        log.exception("Dizayn xatosi")
+        await refund(m.from_user.id, src)
+        await m.answer("⚠️ Rasm yaratib bo'lmadi. Limitingiz qaytarildi, birozdan keyin qayta urinib ko'ring.")
+        return False
+    title = "🎨 Logo tayyor!" if kind == "logo" else "🖼 Banner tayyor (2560×1440)!"
+    await m.answer_photo(BufferedInputFile(data, fname), caption=title)
+    await m.answer_document(BufferedInputFile(data, fname),
+                            caption="Asl fayl (sifati buzilmagan). Yoqmasa, xizmatni qayta tanlab, "
+                                    "boshqacha tasvirlab yuboring.")
+    return True
+
+
+# ---------- Video buyurtma yordamchilari ----------
+def next_prompt(imgs, vids) -> str:
+    if len(imgs) < N:
+        return (f"🖼 {len(imgs) + 1}-qahramon rasmini yuboring. Qahramon to'liq ko'rinsin. "
+                "Fon avtomatik olib tashlanadi, PNG o'lchami moslanadi.")
+    if len(vids) < N:
+        return f"🎞 {len(vids) + 1}-coffin videoni yuboring."
+    return "✅ Hammasi tayyor. «Videoni tayyorlash» tugmasini bosing."
+
+
+def missing(imgs, vids) -> list:
+    return ([f"{i}-rasm" for i in range(len(imgs) + 1, N + 1)] +
+            [f"{i}-video" for i in range(len(vids) + 1, N + 1)])
+
+
+def media_kind(m: Message):
+    if m.photo:
+        return "img"
+    if m.video:
+        return "vid"
+    d = m.document
+    if d and d.mime_type:
+        if d.mime_type.startswith("image/"):
+            return "img"
+        if d.mime_type.startswith("video/"):
+            return "vid"
+    return None
+
+
+async def start_order(m: Message, state: FSMContext, direction: str):
+    await state.set_state(Flow.video)
+    await state.update_data(direction=direction, imgs=[], vids=[])
+    await m.answer(
+        f"{direction}\n\n"
+        "Tayyorlash: taxminan 2–4 daqiqa. Navbat kutish vaqti alohida ko'rsatiladi.\n\n"
+        f"Avval {N} ta rasm, keyin shu tartibdagi {N} ta coffin video yuboring.\n\n"
+        + next_prompt([], []), reply_markup=order_kb(direction))
 
 
 # ---------- Holatlar ----------
@@ -277,6 +394,9 @@ async def to_main(m: Message, state: FSMContext):
 
 @router.message(F.text == BTN_LIMITS)
 async def limits(m: Message):
+    if m.from_user.id in UNLIMITED:
+        await m.answer("🎁 Limitlarim\n\n♾ Sizda cheklov yo'q.")
+        return
     u = await get_user(m.from_user.id)
     await m.answer(
         "🎁 Limitlarim\n\n"
@@ -312,7 +432,7 @@ async def help_(m: Message):
                    "Admin murojaatingizni 24 soat ichida ko'rib chiqadi.", reply_markup=markup)
 
 
-# ---------- Savol-Javob ----------
+# ---------- Savol-Javob, kanal xizmatlari, video: tugmalar ----------
 @router.message(F.text == BTN_QA)
 async def qa_start(m: Message, state: FSMContext):
     await state.set_state(Flow.qa)
@@ -320,12 +440,6 @@ async def qa_start(m: Message, state: FSMContext):
                    "Savolingizni qisqa va aniq yozing.", reply_markup=kb([[BTN_MAIN]]))
 
 
-@router.message(Flow.qa, F.text)
-async def qa(m: Message):
-    await answer_with_ai(m, "q", QA_SYSTEM, m.text)
-
-
-# ---------- Kanal xizmatlari ----------
 @router.message(F.text == BTN_CHANNEL)
 async def channel_menu(m: Message, state: FSMContext):
     await state.clear()
@@ -340,32 +454,54 @@ async def service_pick(m: Message, state: FSMContext):
     await m.answer(SERVICES[key]["ask"], reply_markup=kb([[BTN_MAIN]]))
 
 
-@router.message(Flow.service, F.text)
-async def service_run(m: Message, state: FSMContext):
-    key = (await state.get_data())["key"]
-    ok = await answer_with_ai(m, "s", SERVICES[key]["system"], m.text, max_tokens=1500)
-    if ok:
-        await state.clear()
-        await m.answer("Yana nima kerak?", reply_markup=CHANNEL_KB)
-
-
-# ---------- Video tayyorlash ----------
 @router.message(F.text == BTN_VIDEO)
 async def video_menu(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("Yo'nalishni tanlang:", reply_markup=VIDEO_KB)
+    await m.answer("🎬 Video tayyorlash\n\nYo'nalishni tanlang:", reply_markup=VIDEO_KB)
 
 
 @router.message(F.text.in_(DIRECTIONS))
 async def video_pick(m: Message, state: FSMContext):
-    await state.set_state(Flow.video)
-    await state.update_data(direction=m.text)
-    await m.answer(f"{m.text}\n\n🖼 1-qahramon rasmini yuboring. Qahramon to'liq ko'rinsin. "
-                   "Fon avtomatik olib tashlanadi.", reply_markup=kb([[BTN_MAIN]]))
+    await start_order(m, state, m.text)
 
 
-@router.message(Flow.video, F.photo)
-async def video_photo(m: Message, state: FSMContext):
+@router.message(F.text.startswith(BTN_V_NEW))
+async def order_new(m: Message, state: FSMContext):
+    name = m.text[len(BTN_V_NEW):]
+    direction = next((d for d in DIRECTIONS if d.endswith(name)), None)
+    if direction:
+        await start_order(m, state, direction)
+
+
+@router.message(F.text == BTN_V_FILES)
+async def order_files(m: Message, state: FSMContext):
+    d = await state.get_data()
+    if "direction" not in d:
+        await m.answer("Avval yo'nalishni tanlang:", reply_markup=VIDEO_KB)
+        return
+    n = len(d["imgs"]) + len(d["vids"])
+    await m.answer(f"📦 Qabul qilingan fayllar: {n}/{2 * N}\n\n" + next_prompt(d["imgs"], d["vids"]),
+                   reply_markup=order_kb(d["direction"]))
+
+
+@router.message(F.text == BTN_V_CANCEL)
+async def order_cancel(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("❌ Buyurtma bekor qilindi.\n\nYo'nalishni tanlang:", reply_markup=VIDEO_KB)
+
+
+@router.message(F.text == BTN_V_MAKE)
+async def order_make(m: Message, state: FSMContext):
+    d = await state.get_data()
+    if "direction" not in d:
+        await m.answer("Avval yo'nalishni tanlang:", reply_markup=VIDEO_KB)
+        return
+    imgs, vids, direction = d["imgs"], d["vids"], d["direction"]
+    miss = missing(imgs, vids)
+    if miss:
+        await m.answer("Hali yetishmayapti: " + ", ".join(miss) + ".\n\n" + next_prompt(imgs, vids),
+                       reply_markup=order_kb(direction))
+        return
     if not ADMIN_ID:
         await m.answer("Video xizmati hali ulanmagan.")
         return
@@ -373,15 +509,70 @@ async def video_photo(m: Message, state: FSMContext):
     if not src:
         await m.answer(LIMIT_MSG)
         return
-    direction = (await state.get_data())["direction"]
-    # TODO: bu yerga video generatsiya xizmatini (API) ulang. Hozircha so'rov adminga boradi.
-    await m.bot.send_photo(
-        ADMIN_ID, m.photo[-1].file_id,
-        caption=f"🎬 Yangi video so'rovi\nYo'nalish: {direction}\n"
-                f"Foydalanuvchi: {m.from_user.full_name} (id {m.from_user.id})")
+    try:
+        await m.bot.send_message(
+            ADMIN_ID, f"🎬 Yangi video buyurtmasi\nYo'nalish: {direction}\n"
+                      f"Foydalanuvchi: {m.from_user.full_name} (id {m.from_user.id})\n"
+                      f"Fayllar tartibi: {N} ta rasm, keyin {N} ta coffin video")
+        for it in imgs + vids:
+            await m.bot.copy_message(ADMIN_ID, it["chat"], it["msg"])
+    except Exception:
+        log.exception("Buyurtmani yuborishda xato")
+        await refund(m.from_user.id, src)
+        await m.answer("⚠️ Buyurtmani yuborib bo'lmadi. Limitingiz qaytarildi, qayta urinib ko'ring.")
+        return
     await state.clear()
-    await m.answer("✅ So'rov qabul qilindi. Tayyor bo'lgach, sizga yuboriladi.",
+    await m.answer("✅ Buyurtma qabul qilindi. Video va prevyu tayyor bo'lgach, sizga yuboriladi.",
                    reply_markup=MAIN_KB)
+
+
+# ---------- Holatga bog'liq xabarlar (tugmalardan KEYIN ro'yxatdan o'tadi) ----------
+@router.message(Flow.qa, F.text)
+async def qa(m: Message):
+    await answer_with_ai(m, "q", QA_SYSTEM, m.text)
+
+
+@router.message(Flow.service, F.text)
+async def service_run(m: Message, state: FSMContext):
+    key = (await state.get_data())["key"]
+    if SERVICES[key].get("design"):
+        ok = await make_design(m, key, m.text)
+    else:
+        ok = await answer_with_ai(m, "s", SERVICES[key]["system"], m.text, max_tokens=3000)
+    if ok:
+        await state.clear()
+        await m.answer("Yana nima kerak?", reply_markup=CHANNEL_KB)
+
+
+@router.message(Flow.video, F.photo | F.video | F.document)
+async def order_file(m: Message, state: FSMContext):
+    async with ORDER_LOCKS[m.from_user.id]:
+        d = await state.get_data()
+        imgs, vids, direction = d["imgs"], d["vids"], d["direction"]
+        kind = media_kind(m)
+        item = {"chat": m.chat.id, "msg": m.message_id}
+        if kind is None:
+            text = "Faqat rasm yoki video yuboring.\n\n" + next_prompt(imgs, vids)
+        elif kind == "img" and len(imgs) < N:
+            imgs.append(item)
+            text = f"✅ {len(imgs)}-rasm qabul qilindi.\n\n" + next_prompt(imgs, vids)
+        elif kind == "img":
+            text = "Rasmlar to'liq.\n\n" + next_prompt(imgs, vids)
+        elif len(imgs) < N:
+            text = "Avval rasmlarni yuboring.\n\n" + next_prompt(imgs, vids)
+        elif len(vids) < N:
+            vids.append(item)
+            text = f"✅ {len(vids)}-video qabul qilindi.\n\n" + next_prompt(imgs, vids)
+        else:
+            text = "Videolar to'liq.\n\n" + next_prompt(imgs, vids)
+        await state.update_data(imgs=imgs, vids=vids)
+    await m.answer(text, reply_markup=order_kb(direction))
+
+
+@router.message(Flow.video, F.text)
+async def order_text(m: Message, state: FSMContext):
+    d = await state.get_data()
+    await m.answer(next_prompt(d["imgs"], d["vids"]), reply_markup=order_kb(d["direction"]))
 
 
 @router.message()
