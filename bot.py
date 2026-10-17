@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import secrets
+import tempfile
 from collections import defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -15,13 +16,14 @@ from aiogram.filters import CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (BufferedInputFile, InlineKeyboardButton,
+from aiogram.types import (BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, KeyboardButton, Message,
                            ReplyKeyboardMarkup)
 from dotenv import load_dotenv
 from groq import AsyncGroq
 
 import media
+import render
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +50,9 @@ ai = AsyncGroq(api_key=GROQ_API_KEY)
 router = Router()
 BOT_USERNAME = ""
 ORDER_LOCKS = defaultdict(asyncio.Lock)
+RENDERING = set()                    # hozir video tayyorlanayotgan foydalanuvchilar
+RENDER_SEM = asyncio.Semaphore(1)    # bir vaqtda bitta video (server xotirasi uchun)
+MAX_FILE_MB = 20                     # Telegram bot yuklab ola oladigan eng katta fayl
 
 # ---------- Tugmalar ----------
 BTN_QA = "💬 Savol-Javob 24/7"
@@ -104,15 +109,18 @@ SERVICES = {
         "btn": "🏷 Teglar",
         "ask": "Teglar uchun bitta xabarda yozing:\n1) Kanal nomi?\n2) Videolar qaysi mavzuda?\n"
                "3) Teglar qaysi tilda bo'lsin?",
-        "system": BASE + " Berilgan ma'lumot bo'yicha 20 ta samarali YouTube tegi yoz: "
-                  "avval keng, keyin aniq teglar, vergul bilan ajratilgan bitta qatorda.",
+        "system": BASE + " Faqat foydalanuvchi aytgan ma'lumotlarga (kanal nomi, mavzu, til) tayanib 20 ta "
+                  "samarali YouTube tegi yoz. Ma'lumotni o'zingdan to'qima. Teglar foydalanuvchi so'ragan "
+                  "tilda bo'lsin (ikki til aytilsa, ikkalasida). Avval keng, keyin aniq teglar, vergul "
+                  "bilan ajratilgan bitta qatorda; jami uzunlik 500 belgidan oshmasin.",
     },
     "about": {
         "btn": "📝 Kanal tavsifi",
         "ask": "Kanal tavsifi uchun bitta xabarda yozing:\n1) Kanal nomi?\n"
                "2) Kanalda nimalar ko'rsatiladi?\n3) Qaysi tilda va kimlar uchun yozamiz?",
-        "system": BASE + " Kanal uchun jozibali 'About' tavsifini yoz (1000 belgigacha): "
-                  "qiziqarli kirish, kanal nima haqida, qachon video chiqishi, obunaga chaqiriq.",
+        "system": BASE + " Kanal uchun jozibali 'About' tavsifini yoz (1000 belgigacha), faqat foydalanuvchi "
+                  "aytgan ma'lumotlar asosida va u so'ragan tilda; faktlarni to'qima. Tuzilishi: "
+                  "qiziqarli kirish, kanal nima haqida, kim uchun, obunaga chaqiriq. Kalit so'zlarni tabiiy kirit.",
     },
     "analysis": {
         "btn": "📊 Kanal tahlili",
@@ -285,35 +293,50 @@ def parse_json(text: str) -> dict:
 
 
 async def make_design(m: Message, kind: str, text: str) -> bool:
-    """Logo yoki banner RASMini yaratadi (matn emas)."""
+    """Logo yoki banner RASMini yaratadi: avval AI rasm, bo'lmasa nom va ranglar asosida zaxira dizayn."""
     src = await consume(m.from_user.id, "s")
     if not src:
         await m.answer(LIMIT_MSG)
         return False
     await m.answer("🎨 Tayyorlanmoqda, 30–60 soniya kuting...")
+    await m.bot.send_chat_action(m.chat.id, "upload_photo")
+    info = {}
     try:
-        await m.bot.send_chat_action(m.chat.id, "upload_photo")
-        raw = await ask_ai(DESIGN_SYSTEM + DESIGN_HINT[kind], text[:1500], 2000)
-        info = parse_json(raw)
-        name = str(info.get("name") or text.strip().splitlines()[0])[:40].strip()
-        prompt = str(info.get("prompt") or text)
+        info = parse_json(await ask_ai(DESIGN_SYSTEM + DESIGN_HINT[kind], text[:1500], 2000))
+    except Exception:
+        log.exception("Dizayn tavsifi xatosi")
+    first = text.strip().splitlines()[0] if text.strip() else "Kanal"
+    name = str(info.get("name") or first)[:40].strip()
+    palette = media.make_palette(media.colors_from_text(text), info.get("colors"))
+    prompt = str(info.get("prompt") or text)
+    fallback = False
+    try:
         if kind == "logo":
             img = await media.fetch_image(prompt, 1024, 1024)
+        else:
+            img = media.banner_with_text(await media.fetch_image(prompt, 1280, 720), name)
+    except Exception:
+        log.exception("AI rasm xizmati ishlamadi, zaxira dizayn ishlatiladi")
+        fallback = True
+        draw = media.draw_logo if kind == "logo" else media.draw_banner
+        img = await asyncio.to_thread(draw, name, palette)
+    try:
+        if kind == "logo":
             data, fname = media.to_bytes(img, "PNG"), "logo.png"
         else:
-            img = await media.fetch_image(prompt, 1280, 720)
-            img = media.banner_with_text(img, name)
             data, fname = media.to_bytes(img, "JPEG"), "banner.jpg"
+        title = "🎨 Logo tayyor!" if kind == "logo" else "🖼 Banner tayyor (2560×1440)!"
+        if fallback:
+            title += "\n(AI rasm xizmati band bo'lgani uchun nom va ranglaringiz asosida dizayn qilindi)"
+        await m.answer_photo(BufferedInputFile(data, fname), caption=title)
+        await m.answer_document(BufferedInputFile(data, fname),
+                                caption="Asl fayl (sifati buzilmagan). Yoqmasa, xizmatni qayta tanlab, "
+                                        "boshqacha tasvirlab yuboring.")
     except Exception:
-        log.exception("Dizayn xatosi")
+        log.exception("Rasmni yuborishda xato")
         await refund(m.from_user.id, src)
-        await m.answer("⚠️ Rasm yaratib bo'lmadi. Limitingiz qaytarildi, birozdan keyin qayta urinib ko'ring.")
+        await m.answer("⚠️ Rasmni yuborib bo'lmadi. Limitingiz qaytarildi, qayta urinib ko'ring.")
         return False
-    title = "🎨 Logo tayyor!" if kind == "logo" else "🖼 Banner tayyor (2560×1440)!"
-    await m.answer_photo(BufferedInputFile(data, fname), caption=title)
-    await m.answer_document(BufferedInputFile(data, fname),
-                            caption="Asl fayl (sifati buzilmagan). Yoqmasa, xizmatni qayta tanlab, "
-                                    "boshqacha tasvirlab yuboring.")
     return True
 
 
@@ -354,6 +377,96 @@ async def start_order(m: Message, state: FSMContext, direction: str):
         "Tayyorlash: taxminan 2–4 daqiqa. Navbat kutish vaqti alohida ko'rsatiladi.\n\n"
         f"Avval {N} ta rasm, keyin shu tartibdagi {N} ta coffin video yuboring.\n\n"
         + next_prompt([], []), reply_markup=order_kb(direction))
+
+
+CONFIRM_KB = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="order_ok"),
+    InlineKeyboardButton(text="❌ Bekor qilish", callback_data="order_no")]])
+
+
+def confirm_text(d: dict, uid: int) -> str:
+    title = d["direction"].split(" ", 1)[1]
+    cost = "" if uid in UNLIMITED else "\n\nTasdiqlansa, 1 ta xizmat urinishi sarflanadi."
+    return (f"📋 Buyurtmani tasdiqlang\n\n🎬 {title}\n🖼 Rasmlar: {len(d['imgs'])}/{N}\n"
+            f"🎞 Videolar: {len(d['vids'])}/{N}\n\n"
+            "Video shunday tayyorlanadi: avval 1-video o'z ovozi bilan o'ynaydi, qolgan 3 tasi "
+            "yuborgan rasmingiz bilan to'xtab turadi. Keyin 2-, 3- va 4-video ketma-ket. "
+            "Oxirida prevyu ham yuboriladi." + cost)
+
+
+async def run_order(bot: Bot, chat_id: int, uid: int, state: FSMContext, d: dict):
+    """Tasdiqlangan buyurtma: yuklab olish → panellar → 4 qism → birlashtirish → prevyu → yuborish."""
+    title = d["direction"].split(" ", 1)[1]
+    src = await consume(uid, "s")
+    if not src:
+        await bot.send_message(chat_id, LIMIT_MSG)
+        return
+    RENDERING.add(uid)
+    status = await bot.send_message(
+        chat_id, "⏳ Navbatda turibsiz, iltimos kuting..." if RENDER_SEM.locked() else "⏳ Boshlanmoqda...")
+
+    async def step(text: str):
+        try:
+            await status.edit_text("⏳ Video tayyorlanmoqda (taxminan 2–5 daqiqa)\n\n" + text)
+        except Exception:
+            pass
+
+    ok = False
+    try:
+        async with RENDER_SEM:
+            with tempfile.TemporaryDirectory() as tmp:
+                vpaths, ipaths = [], []
+                total_files = len(d["vids"]) + len(d["imgs"])
+                done = 0
+                for i, it in enumerate(d["vids"]):
+                    done += 1
+                    await step(f"📥 Fayllar yuklab olinmoqda ({done}/{total_files})...")
+                    path = os.path.join(tmp, f"v{i}.mp4")
+                    await bot.download(it["fid"], destination=path, timeout=600)
+                    vpaths.append(path)
+                for i, it in enumerate(d["imgs"]):
+                    done += 1
+                    await step(f"📥 Fayllar yuklab olinmoqda ({done}/{total_files})...")
+                    path = os.path.join(tmp, f"i{i}")
+                    await bot.download(it["fid"], destination=path, timeout=120)
+                    ipaths.append(path)
+                await step("🖼 Rasm panellari tayyorlanmoqda...")
+                panels = await asyncio.to_thread(
+                    lambda: [media.make_panel(p, i, render.PANEL, render.OUT_H,
+                                              os.path.join(tmp, f"panel{i}.png"))
+                             for i, p in enumerate(ipaths)])
+                out = os.path.join(tmp, "video.mp4")
+                total = await render.build(vpaths, panels, out, tmp, progress=step)
+                await step("🖼 Prevyu tayyorlanmoqda...")
+                preview = await asyncio.to_thread(media.make_preview, ipaths, title)
+                await step("📤 Yuborilmoqda (video hajmiga qarab bir necha daqiqa ketishi mumkin)...")
+                await bot.send_video(
+                    chat_id, FSInputFile(out), caption=f"🎬 {title} — video tayyor!",
+                    width=render.PANEL * 4, height=render.OUT_H, duration=int(total),
+                    thumbnail=BufferedInputFile(media.thumb_bytes(preview), "thumb.jpg"),
+                    supports_streaming=True, request_timeout=900)
+                await bot.send_photo(chat_id, BufferedInputFile(preview, "prevyu.jpg"), caption="🖼 Prevyu")
+                await bot.send_document(chat_id, BufferedInputFile(preview, "prevyu.jpg"),
+                                        caption="Prevyu — asl fayl (1280×720).")
+        ok = True
+    except ValueError as e:
+        await refund(uid, src)
+        await bot.send_message(chat_id, f"⚠️ {e} Limitingiz qaytarildi.")
+    except Exception:
+        log.exception("Video tayyorlashda xato")
+        await refund(uid, src)
+        await bot.send_message(chat_id, "⚠️ Video tayyorlab bo'lmadi. Limitingiz qaytarildi. Fayllarni "
+                                        "tekshirib, qayta urinib ko'ring (har bir fayl 20 MB dan oshmasin).")
+    finally:
+        RENDERING.discard(uid)
+        try:
+            await status.delete()
+        except Exception:
+            pass
+    if ok:
+        await state.clear()
+        await bot.send_message(chat_id, "✅ Hammasi tayyor! Yana buyurtma berish uchun yo'nalishni tanlang:",
+                               reply_markup=VIDEO_KB)
 
 
 # ---------- Holatlar ----------
@@ -502,28 +615,37 @@ async def order_make(m: Message, state: FSMContext):
         await m.answer("Hali yetishmayapti: " + ", ".join(miss) + ".\n\n" + next_prompt(imgs, vids),
                        reply_markup=order_kb(direction))
         return
-    if not ADMIN_ID:
-        await m.answer("Video xizmati hali ulanmagan.")
+    if m.from_user.id in RENDERING:
+        await m.answer("⏳ Video hozir tayyorlanmoqda, iltimos kuting.")
         return
-    src = await consume(m.from_user.id, "s")
-    if not src:
-        await m.answer(LIMIT_MSG)
+    await m.answer(confirm_text(d, m.from_user.id), reply_markup=CONFIRM_KB)
+
+
+@router.callback_query(F.data == "order_ok")
+async def order_confirm(cb: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    if "direction" not in d or missing(d["imgs"], d["vids"]):
+        await cb.answer("Buyurtma topilmadi yoki fayllar to'liq emas.", show_alert=True)
         return
+    if cb.from_user.id in RENDERING:
+        await cb.answer("Video allaqachon tayyorlanmoqda.", show_alert=True)
+        return
+    await cb.answer()
     try:
-        await m.bot.send_message(
-            ADMIN_ID, f"🎬 Yangi video buyurtmasi\nYo'nalish: {direction}\n"
-                      f"Foydalanuvchi: {m.from_user.full_name} (id {m.from_user.id})\n"
-                      f"Fayllar tartibi: {N} ta rasm, keyin {N} ta coffin video")
-        for it in imgs + vids:
-            await m.bot.copy_message(ADMIN_ID, it["chat"], it["msg"])
+        await cb.message.edit_text("✅ Buyurtma tasdiqlandi. Tayyorlash boshlandi...")
     except Exception:
-        log.exception("Buyurtmani yuborishda xato")
-        await refund(m.from_user.id, src)
-        await m.answer("⚠️ Buyurtmani yuborib bo'lmadi. Limitingiz qaytarildi, qayta urinib ko'ring.")
-        return
-    await state.clear()
-    await m.answer("✅ Buyurtma qabul qilindi. Video va prevyu tayyor bo'lgach, sizga yuboriladi.",
-                   reply_markup=MAIN_KB)
+        pass
+    await run_order(cb.bot, cb.message.chat.id, cb.from_user.id, state, d)
+
+
+@router.callback_query(F.data == "order_no")
+async def order_decline(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        await cb.message.edit_text("Tasdiqlash bekor qilindi. Fayllar saqlangan, tayyor bo'lsangiz "
+                                   "«Videoni tayyorlash» tugmasini qayta bosing.")
+    except Exception:
+        pass
 
 
 # ---------- Holatga bog'liq xabarlar (tugmalardan KEYIN ro'yxatdan o'tadi) ----------
@@ -550,7 +672,8 @@ async def order_file(m: Message, state: FSMContext):
         d = await state.get_data()
         imgs, vids, direction = d["imgs"], d["vids"], d["direction"]
         kind = media_kind(m)
-        item = {"chat": m.chat.id, "msg": m.message_id}
+        fobj = (m.photo[-1] if m.photo else m.video or m.document)
+        item = {"fid": fobj.file_id}
         if kind is None:
             text = "Faqat rasm yoki video yuboring.\n\n" + next_prompt(imgs, vids)
         elif kind == "img" and len(imgs) < N:
@@ -560,6 +683,10 @@ async def order_file(m: Message, state: FSMContext):
             text = "Rasmlar to'liq.\n\n" + next_prompt(imgs, vids)
         elif len(imgs) < N:
             text = "Avval rasmlarni yuboring.\n\n" + next_prompt(imgs, vids)
+        elif (fobj.file_size or 0) > MAX_FILE_MB * 1024 * 1024:
+            text = (f"⚠️ Video hajmi {MAX_FILE_MB} MB dan katta. Telegram botlari {MAX_FILE_MB} MB gacha "
+                    "fayl qabul qila oladi. Kichikroq (qisqaroq yoki siqilgan) video yuboring.\n\n"
+                    + next_prompt(imgs, vids))
         elif len(vids) < N:
             vids.append(item)
             text = f"✅ {len(vids)}-video qabul qilindi.\n\n" + next_prompt(imgs, vids)
