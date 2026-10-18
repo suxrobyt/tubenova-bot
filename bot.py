@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import tempfile
@@ -26,6 +27,7 @@ from groq import AsyncGroq
 import coffin
 import media
 import render
+import swapper
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -48,9 +50,17 @@ if ADMIN_ID:
 DB = "tubenova.db"
 TZ = ZoneInfo("Asia/Tashkent")
 N = 4                      # Tiles Hop: rasm va video soni
-MAX_FILE_MB = 20           # Telegram bot yuklab ola oladigan eng katta fayl
+TG_API_ID = os.getenv("TG_API_ID", "")        # ixtiyoriy: katta fayllar (MTProto) uchun
+TG_API_HASH = os.getenv("TG_API_HASH", "")
+tg_client = None
 
 ai = AsyncGroq(api_key=GROQ_API_KEY)
+
+
+def max_mb() -> int:
+    """Qabul qilinadigan fayl hajmi: oddiy bot 20 MB, MTProto yoqilgan bo'lsa 200 MB."""
+    return 200 if tg_client is not None else 20
+
 router = Router()
 BOT_USERNAME = ""
 ORDER_LOCKS = defaultdict(asyncio.Lock)
@@ -71,6 +81,7 @@ BTN_V_MAKE = "▶️ Videoni tayyorlash"
 BTN_V_FILES = "📋 Yuborilgan fayllarni ko'rish"
 BTN_V_CANCEL = "❌ Buyurtmani bekor qilish"
 BTN_V_NEW = "🔄 Yangi "
+BTN_SWAP = "🔀 Video joyini almashtirish"
 BTN_ANALYSIS = "📊 YouTube tahlil"
 BTN_A_RUN = "👁 Tahlil qilish"
 BTN_A_NEW = "🆕 Yangi tahlil"
@@ -78,7 +89,8 @@ BTN_A_CANCEL = "❌ Bekor qilish"
 
 DIRECTIONS = ["🎮 Tiles Hop", "🕺 Coffin Dance", "👽 Alien Dance",
               "👾 Tiles Hop EXE", "🏆 GOLDEN COVER", "🎤 Say The Word", "👀 Wrong Eyes"]
-READY = {"Tiles Hop", "Coffin Dance"}     # hozir ishlaydigan yo'nalishlar
+SWAP_DIR = BTN_SWAP
+READY = {"Tiles Hop", "Coffin Dance", "Video joyini almashtirish"}   # ishlaydigan yo'nalishlar
 
 
 def kb(rows):
@@ -87,7 +99,7 @@ def kb(rows):
 
 
 MAIN_KB = kb([[BTN_QA, BTN_SERVICES], [BTN_LIMITS, BTN_REF], [BTN_TOS, BTN_HELP]])
-SERVICES_KB = kb([[BTN_CHANNEL, BTN_VIDEO], [BTN_MAIN]])
+SERVICES_KB = kb([[BTN_CHANNEL, BTN_VIDEO], [BTN_SWAP], [BTN_MAIN]])
 VIDEO_KB = kb([DIRECTIONS[i:i + 2] for i in range(0, len(DIRECTIONS), 2)] + [[BTN_SERVICES], [BTN_MAIN]])
 ANALYSIS_KB = kb([[BTN_A_RUN, BTN_A_NEW], [BTN_A_CANCEL], [BTN_MAIN]])
 
@@ -161,7 +173,8 @@ QA_SYSTEM = BASE + (" Faqat YouTube, kontent yaratish, video tahrirlash va kanal
 
 WELCOME = ("Assalomu alaykum! TubeNova AI yordamchisiga xush kelibsiz.\n\n"
            "Sizga qanday yordam kerak? Quyidagi tugmalardan tanlang.")
-SERVICES_MSG = "🛍 Xizmatlar\n\nKerakli xizmatni tanlang:\n\n📺 Kanal ochish\n🎬 Video tayyorlash"
+SERVICES_MSG = ("🛍 Xizmatlar\n\nKerakli xizmatni tanlang:\n\n📺 Kanal ochish\n🎬 Video tayyorlash\n"
+                "🔀 Video joyini almashtirish")
 VIDEO_MSG = ("🎬 Video tayyorlash\n\nYo'nalishni tanlang: 🎮 Tiles Hop, 🕺 Coffin Dance, 👽 Alien Dance "
              "👾 Tiles Hop EXE, 🏆 GOLDEN COVER 🎤 Say The Word yoki 👀 Wrong Eyes.")
 LIMIT_MSG = ("⏳ Bugungi limit tugadi. Limit har kuni 00:00 da (Toshkent vaqti) yangilanadi.\n"
@@ -376,6 +389,44 @@ class Flow(StatesGroup):
 
 
 # ---------- Video buyurtma: umumiy yordamchilar ----------
+async def fetch(bot: Bot, fid: str, path: str, timeout: int = 600) -> str:
+    """Faylni yuklab oladi. MTProto yoqilgan bo'lsa, 20 MB dan katta fayllar ham olinadi."""
+    if tg_client is not None:
+        try:
+            got = await tg_client.download_media(fid, file_name=path)
+            if got and os.path.exists(str(got)):
+                return str(got)
+        except Exception:
+            log.exception("MTProto yuklab olish xatosi, oddiy usulga o'tilmoqda")
+    await bot.download(fid, destination=path, timeout=timeout)
+    return path
+
+
+def new_order(prev=None) -> list:
+    while True:
+        o = random.sample(range(4), 4)
+        if o != [0, 1, 2, 3] and o != prev:
+            return o
+
+
+def fmt_order(o: list) -> str:
+    return " → ".join(str(i + 1) for i in o)
+
+
+def parse_order(text: str):
+    nums = re.findall(r"[1-4]", text)
+    if len(nums) == 4 and len(set(nums)) == 4 and len(re.sub(r"[\s,.\-→>]", "", text)) == 4:
+        return [int(x) - 1 for x in nums]
+    return None
+
+
+def swap_prompt(d: dict) -> str:
+    if not d["video"]:
+        return f"🎞 Tiles Hop videosini yuboring. Video maksimum {max_mb()} MB."
+    return ("✅ Video tayyor. Yangi tartibni 4 ta raqam bilan yozishingiz mumkin (masalan: 3 1 4 2), "
+            "yozmasangiz bot o'zi aralashtiradi. Tayyor bo'lsa, «Videoni tayyorlash» tugmasini bosing.")
+
+
 def media_kind(m: Message):
     if m.photo:
         return "img"
@@ -406,15 +457,15 @@ def tiles_prompt(d: dict) -> str:
 
 def coffin_prompt(d: dict) -> str:
     if not d["music"]:
-        return (f"🎵 Musiqani yoki musiqasi bor videoni yuboring. Fayl maksimum {MAX_FILE_MB} MB. "
+        return (f"🎵 Musiqani yoki musiqasi bor videoni yuboring. Fayl maksimum {max_mb()} MB. "
                 "Video yuborsangiz, uning ovozi musiqa sifatida ajratib olinadi.")
     if not d["video"]:
-        return f"🎬 Endi montaj uchun videoni yuboring. Video maksimum {MAX_FILE_MB} MB."
+        return f"🎬 Endi montaj uchun videoni yuboring. Video maksimum {max_mb()} MB."
     return "✅ Hammasi tayyor. «Videoni tayyorlash» tugmasini bosing."
 
 
 def next_prompt(d: dict) -> str:
-    return tiles_prompt(d) if d["kind"] == "tiles" else coffin_prompt(d)
+    return {"tiles": tiles_prompt, "coffin": coffin_prompt, "swap": swap_prompt}[d["kind"]](d)
 
 
 def progress_of(d: dict):
@@ -424,6 +475,8 @@ def progress_of(d: dict):
         miss = ([f"{i}-rasm" for i in range(len(imgs) + 1, N + 1)] +
                 [f"{i}-video" for i in range(len(vids) + 1, N + 1)])
         return len(imgs) + len(vids), 2 * N, miss
+    if d["kind"] == "swap":
+        return (1, 1, []) if d["video"] else (0, 1, ["video"])
     miss = (["musiqa"] if not d["music"] else []) + (["video"] if not d["video"] else [])
     return 2 - len(miss), 2, miss
 
@@ -449,6 +502,13 @@ def take_file(d: dict, kind, item: dict) -> str:
         else:
             pre = "Videolar to'liq.\n\n"
         return pre + tiles_prompt(d)
+    if d["kind"] == "swap":
+        if kind == "vid":
+            d["video"] = item
+            pre = "✅ Video qabul qilindi.\n\n"
+        else:
+            pre = "Faqat video yuboring.\n\n"
+        return pre + swap_prompt(d)
     if not d["music"]:
         if kind in ("aud", "vid"):
             d["music"] = item
@@ -472,7 +532,13 @@ async def start_order(m: Message, state: FSMContext, direction: str):
         await m.answer(f"🚧 {name} yo'nalishi tez orada qo'shiladi. "
                        "Hozircha 🎮 Tiles Hop va 🕺 Coffin Dance mavjud.", reply_markup=VIDEO_KB)
         return
-    if name == "Tiles Hop":
+    if name == "Video joyini almashtirish":
+        d = {"kind": "swap", "direction": direction, "video": None, "order": None}
+        text = ("🔀 Video joyini almashtirish\n\nTiles Hop videosini yuboring (4 ta panelli tayyor video). "
+                "Bot personajlar joyini almashtiradi, video esa har doimgidek chap tomondagi 1-o'rindan "
+                "boshlanadi.\n\nTayyorlash: taxminan 2–5 daqiqa. Navbat kutish vaqti alohida ko'rsatiladi.\n\n"
+                + swap_prompt(d))
+    elif name == "Tiles Hop":
         d = {"kind": "tiles", "direction": direction, "imgs": [], "vids": []}
         text = (f"{direction}\n\nTayyorlash: taxminan 2–4 daqiqa. Navbat kutish vaqti alohida ko'rsatiladi.\n\n"
                 f"Avval {N} ta rasm, keyin shu tartibdagi {N} ta coffin video yuboring.\n\n" + tiles_prompt(
@@ -490,9 +556,21 @@ CONFIRM_KB = InlineKeyboardMarkup(inline_keyboard=[[
     InlineKeyboardButton(text="❌ Bekor qilish", callback_data="order_no")]])
 
 
+CONFIRM_SWAP_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="order_ok"),
+     InlineKeyboardButton(text="🔀 Boshqa tartib", callback_data="swap_re")],
+    [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="order_no")]])
+
+
 def confirm_text(d: dict, uid: int) -> str:
     title = d["direction"].split(" ", 1)[1]
     cost = "" if uid in UNLIMITED else "\n\nTasdiqlansa, 1 ta xizmat urinishi sarflanadi."
+    if d["kind"] == "swap":
+        o = d["order"]
+        return (f"📋 Buyurtmani tasdiqlang\n\n🔀 Video joyini almashtirish\n🎞 Video: 1/1\n"
+                f"🔀 Yangi tartib: {fmt_order(o)}\n\n"
+                f"1-o'ringa hozirgi {o[0] + 1}-panel qo'yiladi va video undan boshlanadi. Boshqa tartib "
+                "kerak bo'lsa, «Boshqa tartib» tugmasini bosing yoki 4 ta raqam yozing (masalan 3 1 4 2)." + cost)
     if d["kind"] == "tiles":
         body = (f"🖼 Rasmlar: {len(d['imgs'])}/{N}\n🎞 Videolar: {len(d['vids'])}/{N}\n\n"
                 "Video shunday tayyorlanadi: avval 1-video o'z ovozi bilan o'ynaydi, qolgan 3 tasi "
@@ -514,15 +592,11 @@ async def tiles_job(bot: Bot, chat_id: int, d: dict, step):
         for i, it in enumerate(d["vids"]):
             done += 1
             await step(f"📥 Fayllar yuklab olinmoqda ({done}/{total_files})...")
-            path = os.path.join(tmp, f"v{i}.mp4")
-            await bot.download(it["fid"], destination=path, timeout=600)
-            vpaths.append(path)
+            vpaths.append(await fetch(bot, it["fid"], os.path.join(tmp, f"v{i}.mp4")))
         for i, it in enumerate(d["imgs"]):
             done += 1
             await step(f"📥 Fayllar yuklab olinmoqda ({done}/{total_files})...")
-            path = os.path.join(tmp, f"i{i}")
-            await bot.download(it["fid"], destination=path, timeout=120)
-            ipaths.append(path)
+            ipaths.append(await fetch(bot, it["fid"], os.path.join(tmp, f"i{i}.jpg"), timeout=120))
         await step("🖼 Rasm panellari tayyorlanmoqda...")
         panels = await asyncio.to_thread(
             lambda: [media.make_panel(p, i, render.PANEL, render.OUT_H, os.path.join(tmp, f"panel{i}.png"))
@@ -545,17 +619,29 @@ async def tiles_job(bot: Bot, chat_id: int, d: dict, step):
 async def coffin_job(bot: Bot, chat_id: int, d: dict, step):
     with tempfile.TemporaryDirectory() as tmp:
         await step("📥 Fayllar yuklab olinmoqda (1/2)...")
-        mp = os.path.join(tmp, "music")
-        await bot.download(d["music"]["fid"], destination=mp, timeout=600)
+        mp = await fetch(bot, d["music"]["fid"], os.path.join(tmp, "music.bin"))
         await step("📥 Fayllar yuklab olinmoqda (2/2)...")
-        vp = os.path.join(tmp, "src")
-        await bot.download(d["video"]["fid"], destination=vp, timeout=600)
+        vp = await fetch(bot, d["video"]["fid"], os.path.join(tmp, "src.mp4"))
         out = os.path.join(tmp, "coffin.mp4")
         total = await coffin.build(mp, vp, out, tmp, progress=step)
         await step("📤 Yuborilmoqda (video hajmiga qarab bir necha daqiqa ketishi mumkin)...")
         await bot.send_video(chat_id, FSInputFile(out), caption="🕺 Coffin Dance — video tayyor!",
                              width=coffin.VW, height=coffin.VH, duration=int(total),
                              supports_streaming=True, request_timeout=900)
+
+
+async def swap_job(bot: Bot, chat_id: int, d: dict, step):
+    with tempfile.TemporaryDirectory() as tmp:
+        await step("📥 Video yuklab olinmoqda...")
+        vp = await fetch(bot, d["video"]["fid"], os.path.join(tmp, "src.mp4"))
+        out = os.path.join(tmp, "swapped.mp4")
+        total, ordered = await swapper.build(vp, d["order"], out, tmp, progress=step)
+        await step("📤 Yuborilmoqda (video hajmiga qarab bir necha daqiqa ketishi mumkin)...")
+        await bot.send_video(chat_id, FSInputFile(out), caption=f"🔀 Video tayyor! Yangi tartib: {fmt_order(d['order'])}",
+                             duration=int(total), supports_streaming=True, request_timeout=900)
+        if not ordered:
+            await bot.send_message(chat_id, "ℹ️ Videoda panellar ketma-ket o'ynamagani uchun faqat panel joylari "
+                                            "almashtirildi, ovoz va vaqt o'zgarmadi.")
 
 
 async def run_order(bot: Bot, chat_id: int, uid: int, state: FSMContext, d: dict):
@@ -577,7 +663,7 @@ async def run_order(bot: Bot, chat_id: int, uid: int, state: FSMContext, d: dict
     ok = False
     try:
         async with RENDER_SEM:
-            await (tiles_job if d["kind"] == "tiles" else coffin_job)(bot, chat_id, d, step)
+            await {"tiles": tiles_job, "coffin": coffin_job, "swap": swap_job}[d["kind"]](bot, chat_id, d, step)
         ok = True
     except ValueError as e:
         await refund(uid, src)
@@ -586,7 +672,7 @@ async def run_order(bot: Bot, chat_id: int, uid: int, state: FSMContext, d: dict
         log.exception("Video tayyorlashda xato")
         await refund(uid, src)
         await bot.send_message(chat_id, "⚠️ Video tayyorlab bo'lmadi. Limitingiz qaytarildi. Fayllarni "
-                                        f"tekshirib, qayta urinib ko'ring (har bir fayl {MAX_FILE_MB} MB dan oshmasin).")
+                                        f"tekshirib, qayta urinib ko'ring (har bir fayl {max_mb()} MB dan oshmasin).")
     finally:
         RENDERING.discard(uid)
         try:
@@ -809,10 +895,15 @@ async def video_pick(m: Message, state: FSMContext):
     await start_order(m, state, m.text)
 
 
+@router.message(F.text == BTN_SWAP)
+async def swap_open(m: Message, state: FSMContext):
+    await start_order(m, state, SWAP_DIR)
+
+
 @router.message(F.text.startswith(BTN_V_NEW))
 async def order_new(m: Message, state: FSMContext):
     name = m.text[len(BTN_V_NEW):]
-    direction = next((x for x in DIRECTIONS if x.endswith(name)), None)
+    direction = next((x for x in DIRECTIONS + [SWAP_DIR] if x.endswith(name)), None)
     if direction:
         await start_order(m, state, direction)
 
@@ -848,7 +939,11 @@ async def order_make(m: Message, state: FSMContext):
     if m.from_user.id in RENDERING:
         await m.answer("⏳ Video hozir tayyorlanmoqda, iltimos kuting.")
         return
-    await m.answer(confirm_text(d, m.from_user.id), reply_markup=CONFIRM_KB)
+    if d["kind"] == "swap" and not d.get("order"):
+        d["order"] = new_order()
+        await state.set_data(d)
+    await m.answer(confirm_text(d, m.from_user.id),
+                   reply_markup=CONFIRM_SWAP_KB if d["kind"] == "swap" else CONFIRM_KB)
 
 
 @router.callback_query(F.data == "order_ok")
@@ -866,6 +961,20 @@ async def order_confirm(cb: CallbackQuery, state: FSMContext):
     except Exception:
         pass
     await run_order(cb.bot, cb.message.chat.id, cb.from_user.id, state, d)
+
+
+@router.callback_query(F.data == "swap_re")
+async def swap_reshuffle(cb: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    await cb.answer()
+    if d.get("kind") != "swap":
+        return
+    d["order"] = new_order(d.get("order"))
+    await state.set_data(d)
+    try:
+        await cb.message.edit_text(confirm_text(d, cb.from_user.id), reply_markup=CONFIRM_SWAP_KB)
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data == "order_no")
@@ -938,8 +1047,8 @@ async def order_file(m: Message, state: FSMContext):
         d = await state.get_data()
         kind = media_kind(m)
         fobj = m.photo[-1] if m.photo else (m.video or m.audio or m.voice or m.document)
-        if not m.photo and (fobj.file_size or 0) > MAX_FILE_MB * 1024 * 1024:
-            text = (f"⚠️ Fayl hajmi {MAX_FILE_MB} MB dan katta. Telegram botlari {MAX_FILE_MB} MB gacha "
+        if not m.photo and (fobj.file_size or 0) > max_mb() * 1024 * 1024:
+            text = (f"⚠️ Fayl hajmi {max_mb()} MB dan katta. Telegram botlari {max_mb()} MB gacha "
                     "fayl qabul qila oladi. Kichikroq (qisqaroq yoki siqilgan) fayl yuboring.\n\n"
                     + next_prompt(d))
         else:
@@ -951,6 +1060,14 @@ async def order_file(m: Message, state: FSMContext):
 @router.message(Flow.video, F.text)
 async def order_text(m: Message, state: FSMContext):
     d = await state.get_data()
+    if d["kind"] == "swap":
+        o = parse_order(m.text)
+        if o:
+            d["order"] = o
+            await state.set_data(d)
+            await m.answer(f"✅ Yangi tartib: {fmt_order(o)}\n\n" + swap_prompt(d),
+                           reply_markup=order_kb(d["direction"]))
+            return
     await m.answer(next_prompt(d), reply_markup=order_kb(d["direction"]))
 
 
@@ -961,8 +1078,18 @@ async def fallback(m: Message):
 
 # ---------- Ishga tushirish ----------
 async def main():
-    global BOT_USERNAME
+    global BOT_USERNAME, tg_client
     await init_db()
+    if TG_API_ID and TG_API_HASH:
+        try:
+            from pyrogram import Client as TgClient
+            tg_client = TgClient("tubenova", api_id=int(TG_API_ID), api_hash=TG_API_HASH,
+                                 bot_token=BOT_TOKEN, in_memory=True)
+            await tg_client.start()
+            log.info("MTProto ulandi: katta fayllar (200 MB gacha) yoqildi")
+        except Exception:
+            log.exception("MTProto ulanmadi, fayl chegarasi 20 MB bo'lib qoladi")
+            tg_client = None
     bot = Bot(BOT_TOKEN)
     BOT_USERNAME = (await bot.get_me()).username
     dp = Dispatcher(storage=MemoryStorage())
