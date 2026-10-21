@@ -1,6 +1,5 @@
 """TubeNova AI — YouTuberlar uchun bepul Telegram bot (aiogram 3 + Groq + ffmpeg)."""
 import asyncio
-import base64
 import io
 import json
 import logging
@@ -23,7 +22,9 @@ from aiogram.types import (BufferedInputFile, CallbackQuery, FSInputFile, Inline
                            InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup)
 from dotenv import load_dotenv
 from groq import AsyncGroq
+from PIL import Image
 
+import analysis
 import coffin
 import media
 import render
@@ -37,7 +38,6 @@ log = logging.getLogger("tubenova")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 MODEL = os.getenv("MODEL", "openai/gpt-oss-120b")
-VISION_MODEL = os.getenv("VISION_MODEL", "")          # skrinshot o'qiydigan model (ixtiyoriy)
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")       # @ belgisisiz
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DAILY_Q = int(os.getenv("DAILY_QUESTIONS", "15"))
@@ -55,17 +55,26 @@ TG_API_HASH = os.getenv("TG_API_HASH", "")
 tg_client = None
 
 ai = AsyncGroq(api_key=GROQ_API_KEY)
+router = Router()
+BOT_USERNAME = ""
+ORDER_LOCKS = defaultdict(asyncio.Lock)
+RENDERING = set()                    # hozir video tayyorlanayotgan foydalanuvchilar
+RENDER_SEM = asyncio.Semaphore(1)    # bir vaqtda bitta video (server xotirasi uchun)
+BG = set()                           # fon vazifalari (o'chib ketmasligi uchun ushlab turiladi)
+MAX_SHOTS = 5
 
 
 def max_mb() -> int:
     """Qabul qilinadigan fayl hajmi: oddiy bot 20 MB, MTProto yoqilgan bo'lsa 200 MB."""
     return 200 if tg_client is not None else 20
 
-router = Router()
-BOT_USERNAME = ""
-ORDER_LOCKS = defaultdict(asyncio.Lock)
-RENDERING = set()                    # hozir video tayyorlanayotgan foydalanuvchilar
-RENDER_SEM = asyncio.Semaphore(1)    # bir vaqtda bitta video (server xotirasi uchun)
+
+def spawn(coro):
+    """Vazifani fonda ishga tushiradi: foydalanuvchi kutish paytida botning boshqa bo'limlarini ishlata oladi."""
+    task = asyncio.create_task(coro)
+    BG.add(task)
+    task.add_done_callback(BG.discard)
+
 
 # ---------- Tugmalar ----------
 BTN_QA = "💬 Savol-Javob 24/7"
@@ -109,40 +118,40 @@ def order_kb(direction: str):
     return kb([[BTN_V_MAKE, BTN_V_FILES], [BTN_V_CANCEL, BTN_V_NEW + name], [BTN_MAIN]])
 
 
+CONFIRM_SVC_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="✅ Buyurtmani tasdiqlash", callback_data="svc_ok")],
+    [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="svc_no")]])
+CONFIRM_KB = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="order_ok"),
+    InlineKeyboardButton(text="❌ Bekor qilish", callback_data="order_no")]])
+CONFIRM_SWAP_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="order_ok"),
+     InlineKeyboardButton(text="🔀 Boshqa tartib", callback_data="swap_re")],
+    [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="order_no")]])
+ACCEPTED_MSG = ("⏳ Buyurtmangiz qabul qilindi. Natija tayyor bo'lgach shu chatga yuboriladi. "
+                "Kutish paytida botning boshqa bo'limlaridan foydalanishingiz mumkin.")
+CONFIRM_TAIL = "Boshlash uchun quyidagi tasdiqlash tugmasini bosing. Xatolikda bepul urinish qaytariladi."
+
 # ---------- Kanal ochish xizmatlari ----------
-BASE = ("Sen TubeNova AI — YouTuberlar uchun yordamchisan. Javobni o'zbek tilida "
-        "(lotin yozuvida) ber, agar foydalanuvchi boshqa tilda yozmasa. Aniq va amaliy yoz. "
-        "Markdown belgilarini (**, #, ```) HECH QACHON ishlatma: faqat oddiy matn va emoji.")
+BASE = ("Sen TubeNova AI — YouTuberlar uchun yordamchisan. Foydalanuvchi qaysi tilda yozsa, shu tilda javob ber "
+        "(odatda o'zbek tilida, lotin yozuvida). Foydalanuvchining xabarini diqqat bilan o'qi va aynan u "
+        "so'ragan narsani qil. Aniq va amaliy yoz. Markdown belgilarini (**, #, ```) HECH QACHON ishlatma: "
+        "faqat oddiy matn va emoji.")
 
 ASK_TAIL = "\n\nJavoblarni bitta xabarda yozib yuboring."
 SERVICES = {
-    "logo": {
-        "btn": "🎨 Logo", "design": True,
-        "ask": "Logo uchun:\n1) Kanal nomi nima?\n2) Yo'nalishi qanday?\n"
-               "3) Qaysi rang va uslub yoqadi? (ixtiyoriy)" + ASK_TAIL,
-    },
-    "banner": {
-        "btn": "🖼 Banner", "design": True,
-        "ask": "Banner uchun:\n1) Kanal nomi nima?\n2) Yo'nalishi qanday?\n"
-               "3) Bannerda qanday yozuv va rang bo'lsin? (ixtiyoriy)" + ASK_TAIL,
-    },
-    "tags": {
-        "btn": "🏷 Teglar",
-        "ask": "Teglar uchun:\n1) Kanal nomi nima?\n2) Videolar qaysi mavzuda?\n"
-               "3) Teglar qaysi tilda bo'lsin?" + ASK_TAIL,
-        "system": BASE + " Faqat foydalanuvchi aytgan ma'lumotlarga (kanal nomi, mavzu, til) tayanib 20 ta "
-                  "samarali YouTube tegi yoz. Ma'lumotni o'zingdan to'qima. Teglar foydalanuvchi so'ragan "
-                  "tilda bo'lsin (ikki til aytilsa, ikkalasida). Avval keng, keyin aniq teglar, vergul "
-                  "bilan ajratilgan bitta qatorda; jami uzunlik 500 belgidan oshmasin.",
-    },
-    "about": {
-        "btn": "📝 Kanal tavsifi",
-        "ask": "Kanal tavsifi uchun:\n1) Kanal nomi nima?\n2) Kanalda nimalar ko'rsatiladi?\n"
-               "3) Qaysi tilda va kimlar uchun yozamiz?" + ASK_TAIL,
-        "system": BASE + " Kanal uchun jozibali 'About' tavsifini yoz (1000 belgigacha), faqat foydalanuvchi "
-                  "aytgan ma'lumotlar asosida va u so'ragan tilda; faktlarni to'qima. Tuzilishi: "
-                  "qiziqarli kirish, kanal nima haqida, kim uchun, obunaga chaqiriq. Kalit so'zlarni tabiiy kirit.",
-    },
+    "logo": {"btn": "🎨 Logo", "design": True,
+             "ask": "Logo uchun:\n1) Kanal nomi nima?\n2) Yo'nalishi qanday?\n"
+                    "3) Qaysi rang va uslub yoqadi? (ixtiyoriy)" + ASK_TAIL},
+    "banner": {"btn": "🖼 Banner", "design": True,
+               "ask": "Banner uchun:\n1) Kanal nomi nima?\n2) Yo'nalishi qanday?\n"
+                      "3) Bannerda qanday yozuv va rang bo'lsin? (ixtiyoriy)" + ASK_TAIL},
+    "tags": {"btn": "🏷 Teglar",
+             "ask": "Teglar uchun:\n1) Kanal nomi nima?\n2) Videolar qaysi mavzuda?\n"
+                    "3) Teglar qaysi tilda bo'lsin?" + ASK_TAIL},
+    "about": {"btn": "📝 Kanal tavsifi",
+              "ask": "Kanal tavsifi uchun:\n1) Kanal nomi nima?\n2) Kanalda nimalar ko'rsatiladi?\n"
+                     "3) Qaysi tilda va kimlar uchun yozamiz?" + ASK_TAIL},
 }
 SERVICE_BY_BTN = {s["btn"]: k for k, s in SERVICES.items()}
 CHANNEL_KB = kb([[SERVICES["logo"]["btn"], SERVICES["banner"]["btn"]],
@@ -150,24 +159,75 @@ CHANNEL_KB = kb([[SERVICES["logo"]["btn"], SERVICES["banner"]["btn"]],
                  [BTN_ANALYSIS], [BTN_MAIN]])
 CHANNEL_MSG = "Kanalingiz uchun nima kerak?\n\nLogo, banner, teglar, kanal tavsifi yoki YouTube tahlilini tanlang."
 
-DESIGN_SYSTEM = (
-    "You are an expert logo and YouTube banner designer. From the user's details (any language) "
-    "return ONLY a JSON object, no other text: "
-    '{"name": "<channel name exactly as the user wrote it>", '
-    '"text": "<exact text to print on the banner; the channel name if the user did not ask for other text>", '
-    '"colors": ["#RRGGBB", "#RRGGBB"], "prompt": "<English image-generation prompt>"}. '
-    "colors = the colors the user asked for (hex). "
-    "The prompt must describe artwork only: subject, composition, art style, colors, lighting. "
-    "NEVER include any text, letters, words or real brand logos in the artwork. ")
-DESIGN_HINT = {
-    "logo": "Make a LOGO: one centered emblem or mascot icon on a clean simple background with "
-            "generous margin, bold shapes, suitable for a circular crop, polished vector or 3D style.",
-    "banner": "Make a YouTube BANNER background: wide panoramic 16:9 scene, key elements spread to the "
-              "sides, calm empty space in the center for the channel title, rich cinematic colors.",
+# Mavzularni AI to'g'ri tushunishi uchun qisqa izohlar
+GLOSSARY = {
+    "tiles hop": "Tiles Hop is a mobile rhythm/music arcade game: a ball hops from tile to tile to the beat of a "
+                 "song. Channels post gameplay videos and character-themed music challenges, often as Shorts.",
+    "coffin dance": "Coffin Dance is the viral meme of pallbearers dancing to the song 'Astronomia'; channels post "
+                    "meme edits and beat-synced character videos.",
+    "minecraft": "Minecraft is a sandbox building and survival game.",
+    "roblox": "Roblox is an online platform with user-made games.",
+    "free fire": "Free Fire is a mobile battle royale shooter game.",
+    "pubg": "PUBG Mobile is a mobile battle royale shooter game.",
 }
-ANALYSIS_SYSTEM = (BASE + " Berilgan raqamlar asosida kanalni tahlil qil: kuchli tomonlar, zaif tomonlar "
-                   "va o'sish uchun 5 ta aniq qadam. Kanalga kira olmaysan, havola faqat kanalni "
-                   "aniqlash uchun. Raqam yetishmasa, taxmin qilma — nimani qo'shimcha yuborish kerakligini ayt.")
+
+
+def glossary_for(text: str) -> str:
+    t = text.lower()
+    return " ".join(v for k, v in GLOSSARY.items() if k in t)
+
+
+EXTRACT_SYSTEM = (
+    "You read a short, informal message (Uzbek, Russian or English, often a numbered list) and extract fields. "
+    "Return ONLY a JSON object, no other text: "
+    '{"name": "...", "topic": "...", "language": "...", "audience": "..."}. '
+    "name = the channel name exactly as written, without list numbering such as '1.'. "
+    "topic = what the channel/videos are about, in English, using the user's own words (for example "
+    "'Tiles Hop game videos'); never replace it with a different topic. "
+    "language = the language the OUTPUT must be written in, as an English language name: 'ingliz tilida', "
+    "'inglizcha', 'English' -> English; 'o'zbek', 'o'zbekcha' -> Uzbek; 'rus', 'ruscha', 'русский' -> Russian; "
+    "two languages -> 'English and Uzbek'. If no language is given -> Uzbek. "
+    "audience = target viewers if mentioned, otherwise an empty string.")
+
+TAGS_SYSTEM = (
+    "You write YouTube SEO tags. Output ONLY the tags: one single line, exactly 20 tags separated by commas with "
+    "NO space after the commas (example: Name,Main topic,Main topic gameplay,music game,arcade game). "
+    "Language of the tags: {language} (keep proper nouns and game names unchanged). "
+    "Tag 1 = the exact channel name \"{name}\". Tag 2 = the main topic \"{topic}\". Tags 3-20 = short 2-4 word "
+    "search phrases real viewers type, specific to this niche: gameplay, format, genre, difficulty, device, "
+    "challenge, shorts, trends. Stay strictly on the user's topic; never invent a different game or topic. "
+    "No hashtags, numbering, quotes, explanations or duplicates. Maximum 500 characters in total. {glossary}")
+
+ABOUT_SYSTEM = (
+    "You write a YouTube channel description ('About'). Write ONLY in {language}. 600-900 characters. Structure: "
+    "a catchy first sentence with the main keywords; what the channel shows (strictly based on: {topic}); who it is "
+    "for ({audience}); a short call to subscribe; 2-3 fitting emojis; the last line = 5-8 keywords separated by "
+    "commas. Use the channel name \"{name}\". Do not invent facts (no upload schedule, numbers or claims) unless "
+    "the user gave them. Plain text only, no markdown. {glossary}")
+
+DESIGN_SYSTEM = (
+    "You prepare briefs for logo/banner artwork. The user's message may be in Uzbek, Russian or English and is "
+    "informal (often a numbered list). Return ONLY one JSON object, no other text: "
+    '{"name": "<channel name exactly as written, without list numbering>", '
+    '"text": "<exact text to print on the banner; default = the channel name; use other text only if the user '
+    'explicitly asked for banner text>", "niche": "<channel niche in 3-8 English words>", '
+    '"motif": "<1-2 vivid English phrases describing iconic artwork for this niche, for example \'a glowing '
+    'perspective path of square tiles with a bouncing glossy ball\'; no text, no brand logos>", '
+    '"colors": ["<English color names the user asked for, in order; if none asked, choose 2-3 that fit the niche>"]}. ')
+
+LOGO_PROMPT = (
+    "Premium esports YouTube channel logo badge, perfectly circular emblem on a pure black background, thick "
+    "glowing {c1} ring border, symmetrical centered composition, generous empty margin around the circle. In the "
+    "center: {motif}. Below the motif: one single bold sharp stylized capital letter \"{initial}\" in white with "
+    "{c1} accent shadow. Color palette strictly {palette}. Glossy 3D vector illustration, neon rim light, high "
+    "contrast, crisp edges. No other text, no watermark, no signature.")
+BANNER_PROMPT = (
+    "Ultra-wide cinematic YouTube channel banner artwork. Dark black-charcoal background with subtle {c1} smoky "
+    "texture, flying glass shards and sparks. On the far left a glowing {motif}, on the far right a mirrored {c2} "
+    "version. Large empty dark space in the center for a title. All important elements are arranged in a "
+    "horizontal band in the vertical middle of the image; the top 30% and bottom 30% of the image are plain dark. "
+    "Neon glow, sharp focus, palette strictly {palette}. No text, no letters, no watermark.")
+
 QA_SYSTEM = BASE + (" Faqat YouTube, kontent yaratish, video tahrirlash va kanal o'stirish "
                     "mavzularida javob ber. Boshqa mavzuda xushmuomalalik bilan YouTube'ga qaytar.")
 
@@ -203,6 +263,20 @@ def clean(t: str) -> str:
     t = re.sub(r"(?m)^(\s*)\*\s+", r"\1• ", t)
     t = re.sub(r"(?<![\w*])\*([^\s*][^*\n]*?)\*(?![\w*])", r"\1", t)
     return t.strip()
+
+
+def parse_json(text: str) -> dict:
+    mt = re.search(r"\{.*\}", text, re.S)
+    try:
+        return json.loads(mt.group(0)) if mt else {}
+    except Exception:
+        return {}
+
+
+def first_name(text: str) -> str:
+    """Birinchi qatordan kanal nomini oladi (raqamlash belgilarisiz)."""
+    line = text.strip().splitlines()[0] if text.strip() else "Kanal"
+    return re.sub(r"^\s*\d+\s*[.)\-:]\s*", "", line).strip()[:40] or "Kanal"
 
 
 # ---------- Ma'lumotlar bazasi ----------
@@ -290,6 +364,8 @@ async def refund(uid: int, src: str):
         await db.commit()
 
 
+
+
 # ---------- AI ----------
 async def ask_ai(system: str, prompt: str, max_tokens: int = 2000) -> str:
     kw = {}
@@ -301,9 +377,9 @@ async def ask_ai(system: str, prompt: str, max_tokens: int = 2000) -> str:
     return (r.choices[0].message.content or "").strip()
 
 
-async def send_long(m: Message, text: str, **kw):
+async def send_long(bot: Bot, chat_id: int, text: str, **kw):
     for i in range(0, len(text), 4000):
-        await m.answer(text[i:i + 4000], **kw)
+        await bot.send_message(chat_id, text[i:i + 4000], **kw)
 
 
 async def answer_with_ai(m: Message, kind: str, system: str, prompt: str, max_tokens=2000):
@@ -319,42 +395,35 @@ async def answer_with_ai(m: Message, kind: str, system: str, prompt: str, max_to
         await refund(m.from_user.id, src)
         await m.answer("⚠️ Hozir xatolik yuz berdi. Limitingiz qaytarildi, birozdan keyin urinib ko'ring.")
         return False
-    await send_long(m, clean(text) or "Javob bo'sh chiqdi, iltimos qayta yozing.")
+    await send_long(m.bot, m.chat.id, clean(text) or "Javob bo'sh chiqdi, iltimos qayta yozing.")
     return True
 
 
-def parse_json(text: str) -> dict:
-    mt = re.search(r"\{.*\}", text, re.S)
+# ---------- Kanal xizmatlari (fon vazifalari) ----------
+async def design_job(bot: Bot, chat_id: int, uid: int, src: str, kind: str, text: str):
+    """Logo yoki banner RASMini yaratadi: AI rasm, bo'lmasa nom va ranglar asosida zaxira dizayn."""
+    await bot.send_chat_action(chat_id, "upload_photo")
+    brief = {}
     try:
-        return json.loads(mt.group(0)) if mt else {}
-    except Exception:
-        return {}
-
-
-async def make_design(m: Message, kind: str, text: str) -> bool:
-    """Logo yoki banner RASMini yaratadi: avval AI rasm, bo'lmasa nom va ranglar asosida zaxira dizayn."""
-    src = await consume(m.from_user.id, "s")
-    if not src:
-        await m.answer(LIMIT_MSG)
-        return False
-    await m.answer("🎨 Tayyorlanmoqda, 30–60 soniya kuting...")
-    await m.bot.send_chat_action(m.chat.id, "upload_photo")
-    info = {}
-    try:
-        info = parse_json(await ask_ai(DESIGN_SYSTEM + DESIGN_HINT[kind], text[:1500], 2000))
+        brief = parse_json(await ask_ai(DESIGN_SYSTEM + glossary_for(text), text[:1500], 1500))
     except Exception:
         log.exception("Dizayn tavsifi xatosi")
-    first = text.strip().splitlines()[0] if text.strip() else "Kanal"
-    name = str(info.get("name") or first)[:40].strip()
-    title = str(info.get("text") or name)[:40].strip() if kind == "banner" else name
-    palette = media.make_palette(media.colors_from_text(text), info.get("colors"))
-    prompt = str(info.get("prompt") or text)
+    name = re.sub(r"^\s*\d+\s*[.)\-:]\s*", "", str(brief.get("name") or first_name(text))).strip()[:40] or "Kanal"
+    title = (str(brief.get("text") or name).strip()[:40] or name) if kind == "banner" else name
+    hexes = media.colors_from_text(text) or media.names_to_hex(brief.get("colors"))
+    hexes = hexes[:3] or ["#e53935", "#ffffff"]
+    palette = media.make_palette(hexes, [])
+    names = media.color_names(hexes)
+    motif = str(brief.get("motif") or "").strip() or f"bold glowing emblem symbolizing {brief.get('niche') or name}"
+    fields = dict(c1=names[0], c2=names[1] if len(names) > 1 else names[0], palette=", ".join(names),
+                  motif=motif, initial=media._initial(name))
     fallback = False
     try:
         if kind == "logo":
-            img = await media.fetch_image(prompt, 1024, 1024)
+            img = await media.fetch_image(LOGO_PROMPT.format(**fields), 1024, 1024, wm=40)
         else:
-            img = media.banner_with_text(await media.fetch_image(prompt, 1280, 720), title)
+            art = await media.fetch_image(BANNER_PROMPT.format(**fields), 1792, 1024)
+            img = await asyncio.to_thread(media.compose_banner, art, title, palette)
     except Exception:
         log.exception("AI rasm xizmati ishlamadi, zaxira dizayn ishlatiladi")
         fallback = True
@@ -368,16 +437,63 @@ async def make_design(m: Message, kind: str, text: str) -> bool:
         cap = "🎨 Logo tayyor!" if kind == "logo" else "🖼 Banner tayyor (2560×1440)!"
         if fallback:
             cap += "\n(AI rasm xizmati band bo'lgani uchun nom va ranglaringiz asosida dizayn qilindi)"
-        await m.answer_photo(BufferedInputFile(data, fname), caption=cap)
-        await m.answer_document(BufferedInputFile(data, fname),
+        await bot.send_photo(chat_id, BufferedInputFile(data, fname), caption=cap)
+        await bot.send_document(chat_id, BufferedInputFile(data, fname),
                                 caption="Asl fayl (sifati buzilmagan). Yoqmasa, xizmatni qayta tanlab, "
                                         "boshqacha tasvirlab yuboring.")
     except Exception:
         log.exception("Rasmni yuborishda xato")
-        await refund(m.from_user.id, src)
-        await m.answer("⚠️ Rasmni yuborib bo'lmadi. Limitingiz qaytarildi, qayta urinib ko'ring.")
-        return False
-    return True
+        await refund(uid, src)
+        await bot.send_message(chat_id, "⚠️ Rasmni yuborib bo'lmadi. Limitingiz qaytarildi, qayta urinib ko'ring.")
+
+
+def fix_tags(t: str) -> str:
+    t = clean(t).replace("\n", ",").replace("#", "")
+    t = re.sub(r"(^|,)\s*\d+[.)]\s*", r"\1", t)
+    t = re.sub(r"\s*,\s*", ",", t)
+    return re.sub(r",{2,}", ",", t).strip(", ")
+
+
+async def text_job(bot: Bot, chat_id: int, uid: int, src: str, key: str, text: str):
+    """Teglar yoki kanal tavsifi: avval xabar tushuniladi (nom, mavzu, til), keyin shu tilda yoziladi."""
+    await bot.send_chat_action(chat_id, "typing")
+    try:
+        f = parse_json(await ask_ai(EXTRACT_SYSTEM, text[:1500], 800))
+        name = re.sub(r"^\s*\d+\s*[.)\-:]\s*", "", str(f.get("name") or first_name(text))).strip() or "Kanal"
+        topic = str(f.get("topic") or text).strip()
+        language = str(f.get("language") or "Uzbek").strip()
+        audience = str(f.get("audience") or "").strip() or "general viewers"
+        system = (TAGS_SYSTEM if key == "tags" else ABOUT_SYSTEM).format(
+            language=language, name=name, topic=topic, audience=audience, glossary=glossary_for(text + " " + topic))
+        out = await ask_ai(system, f"Channel name: {name}\nTopic: {topic}\nOutput language: {language}\n"
+                                   f"Audience: {audience}\nUser's original message:\n{text}", 2000)
+        out = fix_tags(out) if key == "tags" else clean(out)
+        if not out:
+            raise ValueError("bo'sh javob")
+    except Exception:
+        log.exception("Matn xizmati xatosi")
+        await refund(uid, src)
+        await bot.send_message(chat_id, "⚠️ Hozir xatolik yuz berdi. Limitingiz qaytarildi, birozdan keyin urinib ko'ring.")
+        return
+    await send_long(bot, chat_id, out)
+
+
+async def analysis_job(bot: Bot, chat_id: int, uid: int, src: str, d: dict):
+    await bot.send_chat_action(chat_id, "typing")
+    try:
+        images = []
+        for fid in d["shots"]:
+            buf = io.BytesIO()
+            await bot.download(fid, destination=buf)
+            images.append(buf.getvalue())
+        text, sources = await analysis.analyze(ai, lambda s, p: ask_ai(s, p, 4000), d["link"], d["notes"], images)
+        text = analysis.with_sources(clean(text), sources)
+    except Exception:
+        log.exception("Tahlil xatosi")
+        await refund(uid, src)
+        await bot.send_message(chat_id, "⚠️ Tahlil qilib bo'lmadi. Limitingiz qaytarildi, birozdan keyin urinib ko'ring.")
+        return
+    await send_long(bot, chat_id, text or "Javob bo'sh chiqdi, qayta urinib ko'ring.")
 
 
 # ---------- Holatlar ----------
@@ -536,30 +652,19 @@ async def start_order(m: Message, state: FSMContext, direction: str):
         d = {"kind": "swap", "direction": direction, "video": None, "order": None}
         text = ("🔀 Video joyini almashtirish\n\nTiles Hop videosini yuboring (4 ta panelli tayyor video). "
                 "Bot personajlar joyini almashtiradi, video esa har doimgidek chap tomondagi 1-o'rindan "
-                "boshlanadi.\n\nTayyorlash: taxminan 2–5 daqiqa. Navbat kutish vaqti alohida ko'rsatiladi.\n\n"
-                + swap_prompt(d))
+                "boshlanadi. Subscribe tugmasi kabi boshqa qismlar o'z joyida qoladi.\n\n"
+                "Tayyorlash: taxminan 3–8 daqiqa. Navbat kutish vaqti alohida ko'rsatiladi.\n\n" + swap_prompt(d))
     elif name == "Tiles Hop":
         d = {"kind": "tiles", "direction": direction, "imgs": [], "vids": []}
         text = (f"{direction}\n\nTayyorlash: taxminan 2–4 daqiqa. Navbat kutish vaqti alohida ko'rsatiladi.\n\n"
-                f"Avval {N} ta rasm, keyin shu tartibdagi {N} ta coffin video yuboring.\n\n" + tiles_prompt(
-                    {"imgs": [], "vids": []}))
+                f"Avval {N} ta rasm, keyin shu tartibdagi {N} ta coffin video yuboring.\n\n"
+                + tiles_prompt({"imgs": [], "vids": []}))
     else:
         d = {"kind": "coffin", "direction": direction, "music": None, "video": None}
         text = COFFIN_INTRO + coffin_prompt(d)
     await state.set_state(Flow.video)
     await state.set_data(d)
     await m.answer(text, reply_markup=order_kb(direction))
-
-
-CONFIRM_KB = InlineKeyboardMarkup(inline_keyboard=[[
-    InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="order_ok"),
-    InlineKeyboardButton(text="❌ Bekor qilish", callback_data="order_no")]])
-
-
-CONFIRM_SWAP_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="order_ok"),
-     InlineKeyboardButton(text="🔀 Boshqa tartib", callback_data="swap_re")],
-    [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="order_no")]])
 
 
 def confirm_text(d: dict, uid: int) -> str:
@@ -569,8 +674,9 @@ def confirm_text(d: dict, uid: int) -> str:
         o = d["order"]
         return (f"📋 Buyurtmani tasdiqlang\n\n🔀 Video joyini almashtirish\n🎞 Video: 1/1\n"
                 f"🔀 Yangi tartib: {fmt_order(o)}\n\n"
-                f"1-o'ringa hozirgi {o[0] + 1}-panel qo'yiladi va video undan boshlanadi. Boshqa tartib "
-                "kerak bo'lsa, «Boshqa tartib» tugmasini bosing yoki 4 ta raqam yozing (masalan 3 1 4 2)." + cost)
+                f"1-o'ringa hozirgi {o[0] + 1}-panel qo'yiladi va video undan boshlanadi. Subscribe tugmasi "
+                "kabi qismlar o'z joyida qoladi. Boshqa tartib kerak bo'lsa, «Boshqa tartib» tugmasini bosing "
+                "yoki 4 ta raqam yozing (masalan 3 1 4 2)." + cost)
     if d["kind"] == "tiles":
         body = (f"🖼 Rasmlar: {len(d['imgs'])}/{N}\n🎞 Videolar: {len(d['vids'])}/{N}\n\n"
                 "Video shunday tayyorlanadi: avval 1-video o'z ovozi bilan o'ynaydi, qolgan 3 tasi "
@@ -635,36 +741,46 @@ async def swap_job(bot: Bot, chat_id: int, d: dict, step):
         await step("📥 Video yuklab olinmoqda...")
         vp = await fetch(bot, d["video"]["fid"], os.path.join(tmp, "src.mp4"))
         out = os.path.join(tmp, "swapped.mp4")
-        total, ordered = await swapper.build(vp, d["order"], out, tmp, progress=step)
+        res = await swapper.build(vp, d["order"], out, tmp, progress=step)
+        preview = None
+        if len(res["frames"]) == 4:
+            await step("🖼 Prevyu tayyorlanmoqda...")
+            try:
+                heroes = [media.oval_cutout(Image.open(p)) for p in res["frames"]]
+                preview = await asyncio.to_thread(media.make_preview_imgs, heroes, "Tiles Hop")
+            except Exception:
+                log.exception("Prevyu yasalmadi")
         await step("📤 Yuborilmoqda (video hajmiga qarab bir necha daqiqa ketishi mumkin)...")
-        await bot.send_video(chat_id, FSInputFile(out), caption=f"🔀 Video tayyor! Yangi tartib: {fmt_order(d['order'])}",
-                             duration=int(total), supports_streaming=True, request_timeout=900)
-        if not ordered:
+        thumb = BufferedInputFile(media.thumb_bytes(preview), "thumb.jpg") if preview else None
+        await bot.send_video(chat_id, FSInputFile(out),
+                             caption=f"🔀 Video tayyor! Yangi tartib: {fmt_order(d['order'])}",
+                             duration=int(res["total"]), thumbnail=thumb, supports_streaming=True,
+                             request_timeout=900)
+        if preview:
+            await bot.send_photo(chat_id, BufferedInputFile(preview, "prevyu.jpg"), caption="🖼 Prevyu")
+            await bot.send_document(chat_id, BufferedInputFile(preview, "prevyu.jpg"),
+                                    caption="Prevyu — asl fayl (1280×720).")
+        if not res["ordered"]:
             await bot.send_message(chat_id, "ℹ️ Videoda panellar ketma-ket o'ynamagani uchun faqat panel joylari "
                                             "almashtirildi, ovoz va vaqt o'zgarmadi.")
 
 
-async def run_order(bot: Bot, chat_id: int, uid: int, state: FSMContext, d: dict):
-    """Tasdiqlangan buyurtma: jarayon xabarlari bilan tayyorlab, natijani yuboradi."""
-    src = await consume(uid, "s")
-    if not src:
-        await bot.send_message(chat_id, LIMIT_MSG)
-        return
+async def run_order(bot: Bot, chat_id: int, uid: int, src: str, d: dict):
+    """Tasdiqlangan buyurtma (fonda): jarayon xabarlari bilan tayyorlab, natijani yuboradi."""
     RENDERING.add(uid)
     status = await bot.send_message(
         chat_id, "⏳ Navbatda turibsiz, iltimos kuting..." if RENDER_SEM.locked() else "⏳ Boshlanmoqda...")
 
     async def step(text: str):
         try:
-            await status.edit_text("⏳ Video tayyorlanmoqda (taxminan 2–5 daqiqa)\n\n" + text)
+            await status.edit_text("⏳ Video tayyorlanmoqda\n\n" + text)
         except Exception:
             pass
 
-    ok = False
     try:
         async with RENDER_SEM:
             await {"tiles": tiles_job, "coffin": coffin_job, "swap": swap_job}[d["kind"]](bot, chat_id, d, step)
-        ok = True
+        await bot.send_message(chat_id, "✅ Buyurtmangiz tayyor!")
     except ValueError as e:
         await refund(uid, src)
         await bot.send_message(chat_id, f"⚠️ {e} Limitingiz qaytarildi.")
@@ -679,10 +795,6 @@ async def run_order(bot: Bot, chat_id: int, uid: int, state: FSMContext, d: dict
             await status.delete()
         except Exception:
             pass
-    if ok:
-        await state.clear()
-        await bot.send_message(chat_id, "✅ Hammasi tayyor! Yana buyurtma berish uchun yo'nalishni tanlang:",
-                               reply_markup=VIDEO_KB)
 
 
 # ---------- YouTube tahlil ----------
@@ -690,10 +802,10 @@ YT_RE = re.compile(r"(?:https?://)?(?:www\.|m\.)?(?:youtube\.com|youtu\.be)/\S+"
 
 
 def analysis_intro() -> str:
-    if VISION_MODEL:
+    if analysis.vision_enabled():
         return ("1-qadam. YouTube kanalingiz havolasi qanday?\n\nMasalan: https://www.youtube.com/@holitech\n"
                 "Havolani yuboring, keyin Studio skrinshotlarini so'rayman.\n\n"
-                "Rasmlar AI orqali tahlil qilinadi.")
+                "Rasmlar AI orqali tahlil qilinadi; yuborgan ma'lumotlaringiz faqat tahlil uchun ishlatiladi.")
     return ("1-qadam. YouTube kanalingiz havolasi qanday?\n\nMasalan: https://www.youtube.com/@holitech\n"
             "Havolani yuboring, keyin Studio raqamlarini so'rayman.")
 
@@ -701,57 +813,25 @@ def analysis_intro() -> str:
 def analysis_prompt(d: dict) -> str:
     if not d["link"]:
         return "Avval kanal havolasini yuboring."
-    if VISION_MODEL:
-        need = ("2-qadam. YouTube Studio skrinshotlarini yuboring (Analytics: ko'rishlar, obunachilar, CTR, "
-                "o'rtacha ko'rish davomiyligi), 1–5 ta rasm. Raqamlarni matn qilib ham yozishingiz mumkin.")
-    else:
-        need = ("2-qadam. Studio raqamlarini matn qilib yozing: obunachilar, ko'rishlar, CTR, o'rtacha "
-                "ko'rish davomiyligi va oxirgi 3–5 ta video nomi.")
     if d["notes"] or d["shots"]:
-        return "Yana ma'lumot qo'shishingiz mumkin. Tayyor bo'lsa, «Tahlil qilish» tugmasini bosing."
-    return need + " Tayyor bo'lgach, «Tahlil qilish» tugmasini bosing."
+        return "Yana ma'lumot qo'shishingiz mumkin. Tayyor bo'lsa, «Tahlil qilish»ni bosing."
+    if analysis.vision_enabled():
+        return ("2-qadam. Studio'dan skrinshotlarni yuboring:\n1) Umumiy ko'rinish\n"
+                "2) Kontent: CTR va tomosha davomiyligi\n3) Auditoriya: tomoshabinlar faol vaqti\n"
+                "4) Videolar ro'yxati: yuklangan sanalar\n5) Ko'rishlar: oldingi davr bilan taqqoslash\n\n"
+                "Sana oralig'i ko'rinsin. Turli bo'limlardan tiniq rasmlar foydaliroq.\n"
+                f"Ko'pi bilan {MAX_SHOTS} ta rasm, har biri 8 MB gacha; bitta rasm bilan ham boshlash mumkin.\n"
+                "Auditoriya mamlakati va vaqt mintaqasini ham yozishingiz mumkin.\n\n"
+                "Tugatgach «Tahlil qilish»ni bosing.")
+    return ("2-qadam. Studio raqamlarini matn qilib yozing: obunachilar, ko'rishlar, CTR, o'rtacha "
+            "ko'rish davomiyligi, auditoriya mamlakati va oxirgi 3–5 ta video nomi.\n\n"
+            "Tugatgach «Tahlil qilish»ni bosing.")
 
 
 async def start_analysis(m: Message, state: FSMContext):
     await state.set_state(Flow.analysis)
-    await state.set_data({"link": None, "notes": [], "shots": []})
+    await state.set_data({"kind": "analysis", "link": None, "notes": [], "shots": []})
     await m.answer(analysis_intro(), reply_markup=ANALYSIS_KB)
-
-
-async def run_analysis(m: Message, state: FSMContext, d: dict):
-    uid = m.from_user.id
-    src = await consume(uid, "s")
-    if not src:
-        await m.answer(LIMIT_MSG)
-        return
-    await m.answer("📊 Tahlil qilinmoqda, bir oz kuting...")
-    await m.bot.send_chat_action(m.chat.id, "typing")
-    prompt = f"Kanal havolasi: {d['link']}\n"
-    if d["notes"]:
-        prompt += "Foydalanuvchi bergan ma'lumotlar:\n" + "\n".join(d["notes"])
-    try:
-        if d["shots"] and VISION_MODEL:
-            content = [{"type": "text", "text": prompt + "\nQuyidagi YouTube Studio skrinshotlaridagi "
-                                                         "raqamlarni o'qib, tahlil qil."}]
-            for fid in d["shots"]:
-                buf = io.BytesIO()
-                await m.bot.download(fid, destination=buf)
-                b64 = base64.b64encode(buf.getvalue()).decode()
-                content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-            r = await ai.chat.completions.create(
-                model=VISION_MODEL, max_tokens=2000,
-                messages=[{"role": "system", "content": ANALYSIS_SYSTEM}, {"role": "user", "content": content}])
-            text = r.choices[0].message.content or ""
-        else:
-            text = await ask_ai(ANALYSIS_SYSTEM, prompt, 3000)
-    except Exception:
-        log.exception("Tahlil xatosi")
-        await refund(uid, src)
-        await m.answer("⚠️ Tahlil qilib bo'lmadi. Limitingiz qaytarildi, birozdan keyin urinib ko'ring.")
-        return
-    await send_long(m, clean(text) or "Javob bo'sh chiqdi, qayta urinib ko'ring.")
-    await state.clear()
-    await m.answer("Yana nima kerak?", reply_markup=CHANNEL_KB)
 
 
 # ---------- Menyu va tugmalar (holatga bog'liq xabarlardan OLDIN ro'yxatdan o'tadi) ----------
@@ -847,7 +927,7 @@ async def channel_menu(m: Message, state: FSMContext):
 async def service_pick(m: Message, state: FSMContext):
     key = SERVICE_BY_BTN[m.text]
     await state.set_state(Flow.service)
-    await state.set_data({"key": key})
+    await state.set_data({"key": key, "text": None})
     await m.answer(SERVICES[key]["ask"], reply_markup=CHANNEL_KB)
 
 
@@ -871,7 +951,7 @@ async def analysis_cancel(m: Message, state: FSMContext):
 @router.message(F.text == BTN_A_RUN)
 async def analysis_run(m: Message, state: FSMContext):
     d = await state.get_data()
-    if "link" not in d:
+    if d.get("kind") != "analysis":
         await start_analysis(m, state)
         return
     miss = (["kanal havolasi"] if not d["link"] else []) + (
@@ -880,7 +960,8 @@ async def analysis_run(m: Message, state: FSMContext):
         await m.answer("Hali yetishmayapti: " + ", ".join(miss) + ".\n\n" + analysis_prompt(d),
                        reply_markup=ANALYSIS_KB)
         return
-    await run_analysis(m, state, d)
+    await m.answer(f"📊 YouTube tahlil\n\n{d['link']}\nSkrinshotlar: {len(d['shots'])}\n\n{CONFIRM_TAIL}",
+                   reply_markup=CONFIRM_SVC_KB)
 
 
 # --- Video tugmalari
@@ -937,7 +1018,7 @@ async def order_make(m: Message, state: FSMContext):
                        reply_markup=order_kb(d["direction"]))
         return
     if m.from_user.id in RENDERING:
-        await m.answer("⏳ Video hozir tayyorlanmoqda, iltimos kuting.")
+        await m.answer("⏳ Sizning videongiz hozir tayyorlanmoqda, iltimos kuting.")
         return
     if d["kind"] == "swap" and not d.get("order"):
         d["order"] = new_order()
@@ -946,21 +1027,69 @@ async def order_make(m: Message, state: FSMContext):
                    reply_markup=CONFIRM_SWAP_KB if d["kind"] == "swap" else CONFIRM_KB)
 
 
+# --- Tasdiqlash tugmalari (inline)
+@router.callback_query(F.data == "svc_ok")
+async def svc_confirm(cb: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    uid, chat_id = cb.from_user.id, cb.message.chat.id
+    if d.get("kind") == "analysis" and d.get("link") and (d["notes"] or d["shots"]):
+        kind = "analysis"
+    elif d.get("key") and d.get("text"):
+        kind = "service"
+    else:
+        await cb.answer("Buyurtma topilmadi. Qaytadan boshlang.", show_alert=True)
+        return
+    src = await consume(uid, "s")
+    if not src:
+        await cb.answer("Bugungi limit tugadi.", show_alert=True)
+        await cb.message.answer(LIMIT_MSG)
+        return
+    await cb.answer()
+    await state.clear()
+    try:
+        await cb.message.edit_text(ACCEPTED_MSG)
+    except Exception:
+        pass
+    bot = cb.bot
+    if kind == "analysis":
+        spawn(analysis_job(bot, chat_id, uid, src, d))
+    elif SERVICES[d["key"]].get("design"):
+        spawn(design_job(bot, chat_id, uid, src, d["key"], d["text"]))
+    else:
+        spawn(text_job(bot, chat_id, uid, src, d["key"], d["text"]))
+
+
+@router.callback_query(F.data == "svc_no")
+async def svc_decline(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        await cb.message.edit_text("Buyurtma bekor qilindi.")
+    except Exception:
+        pass
+
+
 @router.callback_query(F.data == "order_ok")
 async def order_confirm(cb: CallbackQuery, state: FSMContext):
     d = await state.get_data()
-    if "direction" not in d or progress_of(d)[2]:
+    uid = cb.from_user.id
+    if "direction" not in d or progress_of(d)[2] or (d["kind"] == "swap" and not d.get("order")):
         await cb.answer("Buyurtma topilmadi yoki fayllar to'liq emas.", show_alert=True)
         return
-    if cb.from_user.id in RENDERING:
+    if uid in RENDERING:
         await cb.answer("Video allaqachon tayyorlanmoqda.", show_alert=True)
         return
+    src = await consume(uid, "s")
+    if not src:
+        await cb.answer("Bugungi limit tugadi.", show_alert=True)
+        await cb.message.answer(LIMIT_MSG)
+        return
     await cb.answer()
+    await state.clear()
     try:
-        await cb.message.edit_text("✅ Buyurtma tasdiqlandi. Tayyorlash boshlandi...")
+        await cb.message.edit_text(ACCEPTED_MSG)
     except Exception:
         pass
-    await run_order(cb.bot, cb.message.chat.id, cb.from_user.id, state, d)
+    spawn(run_order(cb.bot, cb.message.chat.id, uid, src, d))
 
 
 @router.callback_query(F.data == "swap_re")
@@ -994,15 +1123,15 @@ async def qa(m: Message):
 
 
 @router.message(Flow.service, F.text)
-async def service_run(m: Message, state: FSMContext):
-    key = (await state.get_data())["key"]
-    if SERVICES[key].get("design"):
-        ok = await make_design(m, key, m.text)
-    else:
-        ok = await answer_with_ai(m, "s", SERVICES[key]["system"], m.text, max_tokens=3000)
-    if ok:
-        await state.clear()
-        await m.answer("Yana nima kerak?", reply_markup=CHANNEL_KB)
+async def service_text(m: Message, state: FSMContext):
+    d = await state.get_data()
+    key = d.get("key")
+    if key not in SERVICES:
+        await m.answer(CHANNEL_MSG, reply_markup=CHANNEL_KB)
+        return
+    d["text"] = m.text
+    await state.set_data(d)
+    await m.answer(f"{SERVICES[key]['btn']}\n\n{m.text[:400]}\n\n{CONFIRM_TAIL}", reply_markup=CONFIRM_SVC_KB)
 
 
 @router.message(Flow.analysis, F.text)
@@ -1026,19 +1155,22 @@ async def analysis_text(m: Message, state: FSMContext):
 
 @router.message(Flow.analysis, F.photo)
 async def analysis_photo(m: Message, state: FSMContext):
-    d = await state.get_data()
-    if not VISION_MODEL:
-        await m.answer("Hozircha skrinshotlardan o'qiy olmayman. Raqamlarni matn qilib yozing: obunachilar, "
-                       "ko'rishlar, CTR, o'rtacha ko'rish davomiyligi.", reply_markup=ANALYSIS_KB)
-    elif not d["link"]:
-        await m.answer("Avval YouTube kanal havolasini yuboring.", reply_markup=ANALYSIS_KB)
-    elif len(d["shots"]) >= 5:
-        await m.answer("Skrinshotlar to'liq (5/5). «Tahlil qilish» tugmasini bosing.", reply_markup=ANALYSIS_KB)
-    else:
-        d["shots"].append(m.photo[-1].file_id)
-        await state.set_data(d)
-        await m.answer(f"✅ {len(d['shots'])}-skrinshot qabul qilindi.\n\n" + analysis_prompt(d),
-                       reply_markup=ANALYSIS_KB)
+    async with ORDER_LOCKS[m.from_user.id]:
+        d = await state.get_data()
+        if not analysis.vision_enabled():
+            text = ("Hozircha skrinshotlardan o'qiy olmayman. Raqamlarni matn qilib yozing: obunachilar, "
+                    "ko'rishlar, CTR, o'rtacha ko'rish davomiyligi.")
+        elif not d["link"]:
+            text = "Avval YouTube kanal havolasini yuboring."
+        elif len(d["shots"]) >= MAX_SHOTS:
+            text = f"Skrinshotlar to'liq ({MAX_SHOTS}/{MAX_SHOTS}). «Tahlil qilish»ni bosing."
+        else:
+            d["shots"].append(m.photo[-1].file_id)
+            await state.set_data(d)
+            n = len(d["shots"])
+            text = (f"Skrinshot qabul qilindi: {n}/{MAX_SHOTS}. Endi «Tahlil qilish»ni bosing." if n == MAX_SHOTS
+                    else f"Skrinshot qabul qilindi: {n}/{MAX_SHOTS}. Yana skrinshot yuboring yoki «Tahlil qilish»ni bosing.")
+    await m.answer(text, reply_markup=ANALYSIS_KB)
 
 
 @router.message(Flow.video, F.photo | F.video | F.document | F.audio | F.voice)

@@ -2,6 +2,7 @@
 import asyncio
 import colorsys
 import io
+import os
 import random
 import re
 import urllib.parse
@@ -138,85 +139,215 @@ def glow(img, color, strength=0.5):
 
 
 # ---------- AI rasm ----------
-async def fetch_image(prompt: str, width: int, height: int) -> Image.Image:
-    """Matn tavsifi bo'yicha AI rasm yaratadi (2 marta urinadi)."""
+async def fetch_image(prompt: str, width: int, height: int, wm: int = 0) -> Image.Image:
+    """Matn tavsifi bo'yicha AI rasm yaratadi.
+    POLLINATIONS_KEY bo'lsa suv belgisiz yangi API ishlatiladi. Kalit bo'lmasa suv belgisi pastki burchakda
+    chiqadi: wm > 0 bo'lsa, rasm kattaroq so'raladi va tepa-past chetlari kesib tashlanadi."""
+    key = os.getenv("POLLINATIONS_KEY", "")
+    base = "https://gen.pollinations.ai/image/" if key else API
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    pad = 0 if key else wm
     last = "noma'lum xato"
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-        for _ in range(2):
-            url = (API + urllib.parse.quote(prompt[:900]) +
-                   f"?width={width}&height={height}&seed={random.randint(1, 999999)}"
+    async with httpx.AsyncClient(timeout=90, follow_redirects=True, headers=headers) as client:
+        for attempt in range(3):
+            url = (base + urllib.parse.quote(prompt[:1400]) +
+                   f"?width={width}&height={height + 2 * pad}&seed={random.randint(1, 999999)}"
                    "&nologo=true&model=flux")
             try:
                 r = await client.get(url)
                 if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
-                    return Image.open(io.BytesIO(r.content)).convert("RGB")
+                    img = Image.open(io.BytesIO(r.content)).convert("RGB")
+                    if pad:
+                        sy = img.height / (height + 2 * pad)
+                        box = (0, int(pad * sy), img.width, int((pad + height) * sy))
+                        img = img.crop(box).resize((width, height), Image.LANCZOS)
+                    return img
                 last = f"HTTP {r.status_code}"
             except Exception as e:
                 last = repr(e)
-            await asyncio.sleep(3)
+            await asyncio.sleep(6 * (attempt + 1))
     raise RuntimeError(f"Rasm xizmati javob bermadi: {last}")
 
 
-def banner_with_text(img: Image.Image, name: str) -> Image.Image:
-    """AI rasm ustiga kanal nomini yozadi (2560x1440, markaziy xavfsiz zona)."""
-    w, h = 2560, 1440
-    img = img.convert("RGB").resize((w, h), Image.LANCZOS)
-    if name:
-        d = ImageDraw.Draw(img)
-        f, size = fit_font(d, name, 1400, 220, 70)
-        fancy_text(d, (w // 2, h // 2), name, f, (255, 255, 255), (10, 10, 20),
-                   bold=max(2, size // 40), outw=max(4, size // 16))
-    return img
+# ---------- Ranglar nomi (AI uchun) ----------
+HEX_NAME = {}
+for _w, _h in COLOR_WORDS.items():
+    if _w.isascii() and _h not in HEX_NAME:
+        HEX_NAME[_h] = _w
+HEX_NAME.update({"#ffffff": "white", "#111111": "black", "#9e9e9e": "gray", "#e53935": "red",
+                 "#1e88e5": "blue", "#2e9e47": "green", "#fdd835": "yellow", "#fb8c00": "orange",
+                 "#8e24aa": "purple", "#ec407a": "pink", "#ffc107": "gold", "#00bcd4": "cyan"})
+
+
+def color_names(hexes: list) -> list:
+    return [HEX_NAME.get(h.lower(), h) for h in hexes]
+
+
+def names_to_hex(names) -> list:
+    out = []
+    for n in names if isinstance(names, list) else []:
+        n = str(n).strip().lower()
+        if _valid(n):
+            out.append(n)
+            continue
+        for word, hv in COLOR_WORDS.items():
+            if word.isascii() and (n == word or n.startswith(word) or word in n.split()):
+                if hv not in out:
+                    out.append(hv)
+                break
+    return out
+
+
+def pick_accent(palette) -> tuple:
+    """Eng yorqin (to'yingan) rang; hammasi oq/qora/kulrang bo'lsa, eng yorug'i."""
+    best, score = palette[0], -1.0
+    for c in palette:
+        h, s, v = colorsys.rgb_to_hsv(*(x / 255 for x in c))
+        sc = s * v if v > 0.25 else 0
+        if sc > score:
+            best, score = c, sc
+    if score < 0.2:
+        best = max(palette, key=lambda c: sum(c))
+    return best
+
+
+def _title_font(size: int):
+    for name in ("DejaVuSans-BoldOblique.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-BoldItalic.ttf",
+                 "LiberationSans-Bold.ttf", "Arial Bold.ttf", "arialbd.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            pass
+    return _font(size)
+
+
+def chrome_title(text: str, accent, max_w: int, max_h: int, start: int = 260) -> Image.Image:
+    """Metall (kumush) + rangli 3D yozuv: birinchi qism kumush, qolgani accent rangda."""
+    probe = ImageDraw.Draw(Image.new("L", (10, 10)))
+    size = start
+    f = _title_font(size)
+    while size > 50 and (probe.textlength(text, font=f) > max_w or size * 1.25 > max_h):
+        size -= 8
+        f = _title_font(size)
+    words = text.split()
+    if len(words) >= 2:
+        a, b = words[0] + " ", " ".join(words[1:])
+    else:
+        k = max(1, int(len(text) * 0.45)) if len(text) > 1 else 1
+        a, b = text[:k], text[k:]
+    wa = probe.textlength(a, font=f)
+    wb = probe.textlength(b, font=f) if b else 0
+    pad = size // 3
+    w, h = int(wa + wb) + 2 * pad, int(size * 1.45) + 2 * pad
+
+    def mask_for(txt, x):
+        m = Image.new("L", (w, h), 0)
+        if txt:
+            ImageDraw.Draw(m).text((x, pad), txt, font=f, fill=255)
+        return m
+
+    ma, mb = mask_for(a, pad), mask_for(b, pad + wa)
+    full = ImageChops.lighter(ma, mb)
+    sw = max(3, size // 26)
+    outline = full.filter(ImageFilter.MaxFilter(2 * sw + 1))
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    glow_a = full.filter(ImageFilter.GaussianBlur(size // 9)).point(lambda v: int(v * 0.75))
+    gl = Image.new("RGBA", (w, h), tuple(accent) + (0,))
+    gl.putalpha(glow_a)
+    layer = Image.alpha_composite(layer, gl)
+    shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    shadow.putalpha(ImageChops.offset(outline, sw, sw).filter(ImageFilter.GaussianBlur(sw)))
+    layer = Image.alpha_composite(layer, shadow)
+    dark = Image.new("RGBA", (w, h), (8, 8, 12, 255))
+    dark.putalpha(outline)
+    layer = Image.alpha_composite(layer, dark)
+    grad = Image.linear_gradient("L").resize((w, h))
+    vshape = ImageChops.difference(grad, Image.new("L", (w, h), 120)).point(lambda v: min(255, v * 2))
+    silver = ImageOps.colorize(vshape, black=(112, 118, 130), mid=(176, 182, 194),
+                               white=(252, 252, 255)).convert("RGBA")
+    silver.putalpha(ma)
+    layer = Image.alpha_composite(layer, silver)
+    acc = ImageOps.colorize(vshape, black=tuple(int(c * 0.4) for c in accent), mid=tuple(accent),
+                            white=lighten(accent, 0.5)).convert("RGBA")
+    acc.putalpha(mb)
+    layer = Image.alpha_composite(layer, acc)
+    box = layer.getchannel("A").getbbox()
+    return layer.crop(box) if box else layer
+
+
+def compose_banner(art: Image.Image, title: str, palette) -> Image.Image:
+    """2560x1440 banner: markazda 2560x423 rasm lentasi, ustida 3D nom; chetlari qorong'i (TV uchun)."""
+    w, h, bh = 2560, 1440, 423
+    bg = gradient((w, h), (18, 20, 26), (9, 10, 14))
+    ar = w / bh
+    aw, ah = art.size
+    if aw / ah > ar:
+        nw = int(ah * ar)
+        box = ((aw - nw) // 2, 0, (aw - nw) // 2 + nw, ah)
+    else:
+        nh = int(aw / ar)
+        box = (0, (ah - nh) // 2, aw, (ah - nh) // 2 + nh)
+    band = art.convert("RGB").crop(box).resize((w, bh), Image.LANCZOS)
+    y = (h - bh) // 2
+    bg.paste(band, (0, y))
+    if title:
+        t = chrome_title(title, pick_accent(palette), 1400, int(bh * 0.78))
+        bg.paste(t, ((w - t.width) // 2, y + (bh - t.height) // 2), t)
+    return bg
 
 
 # ---------- Zaxira dizayn (AI xizmati ishlamasa ham rasm chiqadi) ----------
-def _initials(name: str) -> str:
+def _initial(name: str) -> str:
     words = re.findall(r"\w+", name, re.U)
-    if not words:
-        return "TN"
-    if len(words) == 1:
-        return words[0][0].upper()
-    return (words[0][0] + words[1][0]).upper()
+    return words[0][0].upper() if words else "T"
 
 
 def draw_logo(name: str, palette) -> Image.Image:
+    """Zaxira logo: qora doira, yorqin halqa va metall bosh harf."""
     s = 1024
-    c1, c2 = palette[0], palette[1]
-    img = glow(gradient((s, s), c1, c2), lighten(c1, 0.55), 0.6).convert("RGBA")
-    ov = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    d = ImageDraw.Draw(ov)
-    d.ellipse((60, 60, s - 60, s - 60), outline=(255, 255, 255, 210), width=14)
-    d.ellipse((105, 105, s - 105, s - 105), outline=(255, 255, 255, 90), width=4)
-    img = Image.alpha_composite(img, ov)
-    d = ImageDraw.Draw(img)
-    fg, ol = text_colors(c1, c2)
-    txt = _initials(name)
-    f, _ = fit_font(d, txt, 560, 440, 200)
-    fancy_text(d, (s // 2, s // 2 + 10), txt, f, fg, ol, bold=8, outw=10)
+    acc = pick_accent(palette)
+    img = Image.new("RGB", (s, s), (6, 6, 8))
+    img = glow(img, tuple(int(c * 0.35) for c in acc), 0.5).convert("RGBA")
+    ring = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    ImageDraw.Draw(ring).ellipse((70, 70, s - 70, s - 70), outline=tuple(acc) + (255,), width=26)
+    img = Image.alpha_composite(img, ring.filter(ImageFilter.GaussianBlur(18)))
+    img = Image.alpha_composite(img, ring)
+    ImageDraw.Draw(img).ellipse((120, 120, s - 120, s - 120), outline=(255, 255, 255, 200), width=5)
+    t = chrome_title(_initial(name), acc, 560, 560, start=520)
+    img.paste(t, ((s - t.width) // 2, (s - t.height) // 2), t)
+    return img.convert("RGB")
+
+
+def procedural_art(palette, w: int = 2560, h: int = 423) -> Image.Image:
+    """AI rasm bo'lmasa: qorong'i fon, rangli yorug'lik izlari va zarralar."""
+    c1 = pick_accent(palette)
+    c2 = palette[1] if len(palette) > 1 else lighten(c1, 0.5)
+    img = gradient((w, h), (14, 15, 20), (8, 9, 12)).convert("RGBA")
+    rnd = random.Random(sum(c1) + sum(c2))
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    for side in (0, 1):
+        col = c1 if side == 0 else c2
+        for _ in range(14):
+            x = rnd.randint(0, w // 3) if side == 0 else rnd.randint(2 * w // 3, w)
+            y = rnd.randint(-50, h)
+            ln, wd = rnd.randint(120, 520), rnd.randint(3, 10)
+            d.polygon([(x, y), (x + wd, y), (x + wd + ln // 3, y + ln), (x + ln // 3, y + ln)],
+                      fill=tuple(col) + (rnd.randint(40, 120),))
+        for _ in range(26):
+            x = rnd.randint(0, w // 3) if side == 0 else rnd.randint(2 * w // 3, w)
+            y = rnd.randint(0, h)
+            r = rnd.randint(3, 9)
+            d.polygon([(x, y - r), (x + r, y), (x, y + r), (x - r, y)], fill=tuple(lighten(col, 0.5)) + (200,))
+        cx = w // 6 if side == 0 else 5 * w // 6
+        d.ellipse((cx - 150, h // 2 - 95, cx + 150, h // 2 + 95), fill=tuple(col) + (150,))
+    img = Image.alpha_composite(img, layer.filter(ImageFilter.GaussianBlur(14)))
+    img = Image.alpha_composite(img, layer)
     return img.convert("RGB")
 
 
 def draw_banner(name: str, palette) -> Image.Image:
-    w, h = 2560, 1440
-    c1, c2 = palette[0], palette[1]
-    c3 = palette[2] if len(palette) > 2 else lighten(c2, 0.4)
-    img = glow(gradient((w, h), c1, c2), lighten(c2, 0.4), 0.5).convert("RGBA")
-    ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    d = ImageDraw.Draw(ov)
-    rnd = random.Random(sum(map(ord, name)))
-    for _ in range(9):
-        r = rnd.randint(120, 380)
-        x, y = rnd.randint(-100, w + 100), rnd.randint(-100, h + 100)
-        d.ellipse((x - r, y - r, x + r, y + r), fill=lighten(c3, 0.3) + (38,))
-    img = Image.alpha_composite(img, ov.filter(ImageFilter.GaussianBlur(6)))
-    d = ImageDraw.Draw(img)
-    fg, ol = text_colors(c1, c2)
-    f, size = fit_font(d, name, 1400, 220, 70)
-    fancy_text(d, (w // 2, h // 2 - 10), name, f, fg, ol,
-               bold=max(2, size // 40), outw=max(4, size // 18))
-    d.rounded_rectangle((w // 2 - 360, h // 2 + size // 2 + 40, w // 2 + 360, h // 2 + size // 2 + 54),
-                        radius=7, fill=lighten(c3, 0.2) + (255,))
-    return img.convert("RGB")
+    return compose_banner(procedural_art(palette), name, palette)
 
 
 # ---------- Video prevyusi ----------
@@ -244,29 +375,36 @@ def remove_bg(img: Image.Image, tol: int = 70) -> Image.Image:
     return img
 
 
-def make_preview(paths: list, title: str) -> bytes:
-    """4 qahramon rasmidan 1280x720 prevyu (YouTube thumbnail) yasaydi."""
+def oval_cutout(img: Image.Image) -> Image.Image:
+    """Panel tepasidagi oval personaj kesimini shaffof oval qilib beradi."""
+    img = img.convert("RGBA")
+    m = Image.new("L", img.size, 0)
+    ImageDraw.Draw(m).ellipse((2, 2, img.width - 3, img.height - 3), fill=255)
+    img.putalpha(m.filter(ImageFilter.GaussianBlur(1)))
+    return img
+
+
+def _compose_preview(heroes: list, title: str) -> bytes:
+    """Qahramonlar (RGBA) dan 1280x720 prevyu (YouTube thumbnail) yasaydi."""
     w, h = 1280, 720
     bg = gradient((w, h), (8, 14, 46), (0, 110, 135))
     bg = glow(bg, (40, 210, 220), 0.5).convert("RGBA")
-    n = len(paths)
+    n = len(heroes)
     col_w = w // n
     base_y = 650
     layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    for i, p in enumerate(paths):
+    for i, hero in enumerate(heroes):
         color = GLOWS[i % len(GLOWS)]
         cx = col_w * i + col_w // 2
         pad = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        pd = ImageDraw.Draw(pad)
-        pd.rounded_rectangle((cx - 125, base_y - 62, cx + 125, base_y + 14), radius=16,
-                             fill=color + (110,), outline=(255, 255, 255, 235), width=5)
+        ImageDraw.Draw(pad).rounded_rectangle((cx - 125, base_y - 62, cx + 125, base_y + 14), radius=16,
+                                              fill=color + (110,), outline=(255, 255, 255, 235), width=5)
         layer = Image.alpha_composite(layer, pad.filter(ImageFilter.GaussianBlur(1.5)))
         try:
-            hero = remove_bg(Image.open(p))
             box = hero.getchannel("A").getbbox()
             if box:
                 hero = hero.crop(box)
-            hero = ImageOps.contain(hero, (col_w - 30, 470))
+            hero = ImageOps.contain(hero, (col_w - 14, 470))
             pos = (cx - hero.width // 2, base_y - 30 - hero.height)
             pad_a = Image.new("L", (w, h), 0)
             pad_a.paste(hero.getchannel("A"), pos)
@@ -287,6 +425,22 @@ def make_preview(paths: list, title: str) -> bytes:
     buf = io.BytesIO()
     img.convert("RGB").save(buf, "JPEG", quality=92)
     return buf.getvalue()
+
+
+def make_preview(paths: list, title: str) -> bytes:
+    """Yuborilgan rasmlar (fon olib tashlanadi) dan prevyu."""
+    heroes = []
+    for p in paths:
+        try:
+            heroes.append(remove_bg(Image.open(p)))
+        except Exception:
+            heroes.append(Image.new("RGBA", (10, 10), (0, 0, 0, 0)))
+    return _compose_preview(heroes, title)
+
+
+def make_preview_imgs(images: list, title: str) -> bytes:
+    """Tayyor RGBA personaj rasmlaridan (video kadrlaridan olingan) prevyu."""
+    return _compose_preview(images, title)
 
 
 def to_bytes(img: Image.Image, fmt: str) -> bytes:
