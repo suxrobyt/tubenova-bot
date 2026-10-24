@@ -7,3 +7,4 @@ httpx>=0.27
 imageio-ffmpeg>=0.5
 numpy>=1.26
 kurigram>=2.1
+tgcrypto
