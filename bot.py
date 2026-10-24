@@ -13,6 +13,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import aiosqlite
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -74,6 +75,19 @@ def spawn(coro):
     task = asyncio.create_task(coro)
     BG.add(task)
     task.add_done_callback(BG.discard)
+
+
+async def health(request):
+    return web.Response(text="OK")
+
+
+async def start_web():
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
 
 
 # ---------- Tugmalar ----------
@@ -1211,6 +1225,7 @@ async def fallback(m: Message):
 # ---------- Ishga tushirish ----------
 async def main():
     global BOT_USERNAME, tg_client
+    await start_web()
     await init_db()
     if TG_API_ID and TG_API_HASH:
         try:
