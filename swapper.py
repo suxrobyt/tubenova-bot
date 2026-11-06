@@ -1,23 +1,18 @@
-"""Video joyini almashtirish: 4 panelli Tiles Hop videosida personajlar (panellar) joyini o'zgartiradi.
-Yuqori qatlamlar (Subscribe paneli, 3-2-1 raqamlari kabi) o'z joyida va o'z vaqtida qoladi.
-Prevyu uchun har bir panelning 'to'xtab turgan' tasviri ishlatiladi (dumaloq kesim emas)."""
+"""Video joyini almashtirish: 4 panelli Tiles Hop videosida personajlar joyini o'zgartiradi."""
 import asyncio
-import logging
 import os
 import re
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageFilter
 
+import heroes as heroes_mod
 import render
 from render import FFMPEG, _run
 
-log = logging.getLogger("swapper")
-
 FPS = 30
-SW, SH = 96, 54                 # harakatni tahlil qilish uchun kichraytirilgan kadr (har panel 24 px)
+SW, SH = 96, 54                 # tahlil uchun kichraytirilgan kadr (har panel 24 px)
 MAX_SEC = 400
-DIFF_T = 40                     # "dam olish" rasmidan farq chegarasi (yuqori qatlam belgisi)
 
 
 class NotSequential(Exception):
@@ -50,184 +45,236 @@ async def _motion(path: str) -> np.ndarray:
     return d.reshape(n - 1, SH, 4, SW // 4).mean(axis=(1, 3))
 
 
-# ---------- Dam olish rasmi va yuqori qatlam (overlay) aniqlash ----------
-async def _rest_image(video: str, w: int, dur: float, tmp: str, active: list, avoid: list, times=None):
-    """Har bir panelning 'dam olish' holati: u to'xtab turgan va Subscribe ko'rinmagan paytlardagi kadrlarning
-    median qiymati. times berilsa, faqat shu vaqtlardan namuna olinadi (fallback: video oxiri)."""
-    if times is None:
-        times = [dur * (k + 0.5) / 24 for k in range(24)]
-    cw = w // 4
-    crops = [[] for _ in range(4)]
-    allc = [[] for _ in range(4)]
-    shape = None
-    fr = None
-    for t in times:
-        fp = os.path.join(tmp, "rf.png")
-        rc, _ = await _run(["-y", "-ss", f"{t:.3f}", "-i", video, "-frames:v", "1", fp], 120)
-        if rc != 0 or not os.path.exists(fp):
-            continue
-        fr = np.asarray(Image.open(fp).convert("RGB"))
-        shape = fr.shape
-        clean_t = not any(a0 - 0.2 <= t <= b0 + 0.2 for a0, b0 in avoid)
-        for c in range(4):
-            col = fr[:, c * cw:(c + 1) * cw].copy()
-            allc[c].append(col)
-            if clean_t and not (active[c][0] <= t <= active[c][1]):
-                crops[c].append(col)
-    if shape is None:
-        return None
-    r = np.zeros(shape, dtype=np.uint8)
-    for c in range(4):
-        use = crops[c] if len(crops[c]) >= 5 else allc[c]
-        r[:, c * cw:(c + 1) * cw] = np.median(np.stack(use), axis=0).astype(np.uint8)
-    if shape[1] > 4 * cw and fr is not None:
-        r[:, 4 * cw:] = fr[:, 4 * cw:]
-    path = os.path.join(tmp, "rest.png")
-    Image.fromarray(r).save(path)
-    return r, path
-
-
-def _all_runs(b, min_len=1):
-    out, s0 = [], None
+def _longest_run(b):
+    best, s0 = None, None
     for i, v in enumerate(list(b) + [False]):
         if v and s0 is None:
             s0 = i
         if (not v) and s0 is not None:
-            if i - s0 >= min_len:
-                out.append((s0, i))
+            if best is None or i - s0 > best[1] - best[0]:
+                best = (s0, i)
             s0 = None
-    return out
+    return best
 
 
 def _bar_bbox(fr):
-    """Kadrdagi katta oq to'rtburchak (Subscribe paneli kabi) — (x0,y0,x1,y1) yoki None.
-    Barcha qator-bloklari ichidan eng keng, to'la va yassi nisbatli kandidat tanlanadi —
-    shunda oq personajlar (doira kabi) adashtirmaydi."""
+    """Kadrdagi katta oq to'rtburchak (Subscribe paneli kabi) — (x0,y0,x1,y1) yoki None."""
     hh, ww = fr.shape[:2]
     m = fr.min(axis=2) >= 215
-    y0 = int(0.3 * hh)
+    y0 = int(0.45 * hh)
     sub = m[y0:]
-    best = None
-    for r0, r1 in _all_runs(sub.mean(axis=1) > 0.14, min_len=max(int(0.05 * hh), 6)):
-        if r1 - r0 > 0.3 * hh:
-            continue
-        band = sub[r0:r1]
-        for c0, c1 in _all_runs(band.mean(axis=0) > 0.45, min_len=int(0.2 * ww)):
-            box = band[:, c0:c1]
-            bw, bh = c1 - c0, r1 - r0
-            if bw < 2.2 * bh:
-                continue
-            fill = box.mean()
-            if fill < 0.5:
-                continue
-            score = fill * bw
-            if best is None or score > best[0]:
-                best = (score, (c0, y0 + r0, c1, y0 + r1))
-    return best[1] if best else None
+    rows = _longest_run(sub.mean(axis=1) > 0.14)
+    if not rows or rows[1] - rows[0] < 0.06 * hh:
+        return None
+    band = sub[rows[0]:rows[1]]
+    cols = _longest_run(band.mean(axis=0) > 0.45)
+    if not cols or cols[1] - cols[0] < 0.2 * ww:
+        return None
+    box = band[:, cols[0]:cols[1]]
+    bw, bh = cols[1] - cols[0], rows[1] - rows[0]
+    if bw < 2.2 * bh or box.mean() < 0.6:
+        return None
+    return cols[0], y0 + rows[0], cols[1], y0 + rows[1]
 
 
-def _merge(times, gap=0.35, min_len=0.4, pad_a=0.1, pad_b=0.2):
-    if not times:
-        return []
-    out, start, prev = [], times[0], times[0]
-    for t in times[1:]:
-        if t - prev > gap:
-            out.append((start, prev))
-            start = t
-        prev = t
-    out.append((start, prev))
-    return [(max(a - pad_a, 0.0), b + pad_b) for a, b in out if b - a >= min_len]
+GW = 480                         # overlay tahlili uchun kadr eni (har panel 120 px)
+MARGIN = 0.4                     # segment chegarasidan shuncha soniya tashlab ketiladi
+DIFF_THR = 36                    # "muzlagan" panelga nisbatan farq chegarasi
+EV_GAP = 5                       # shuncha kadr (10 fps) ichida bo'lsa — bitta hodisa
 
 
-SWL = 384
-
-
-async def _lowres(path: str, w: int, h: int, tmp: str):
-    """Videoni kichik o'lchamda (10 kadr/s) diskka yozib oladi va oq Subscribe panelini aniqlaydi."""
-    sh = max(2, round(SWL * h / w))
-    raw_path = os.path.join(tmp, "lowres.raw")
+async def _frames(path: str, fps: int, gw: int, gh: int):
+    """(vaqt, RGB kadr) ni oqim bilan beradi (kichraytirilgan)."""
     proc = await asyncio.create_subprocess_exec(
-        FFMPEG, "-v", "error", "-i", path, "-an", "-vf", f"fps=10,scale={SWL}:{sh}",
+        FFMPEG, "-v", "error", "-i", path, "-an", "-vf", f"fps={fps},scale={gw}:{gh}:flags=area",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-", stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL)
-    fs = SWL * sh * 3
-    bar_t, bar_boxes, n = [], [], 0
-    with open(raw_path, "wb") as f:
+    fs = gw * gh * 3
+    i = 0
+    try:
         while True:
             try:
                 data = await proc.stdout.readexactly(fs)
             except asyncio.IncompleteReadError:
                 break
-            f.write(data)
-            bb = _bar_bbox(np.frombuffer(data, np.uint8).reshape(sh, SWL, 3))
-            if bb:
-                bar_t.append(n / 10)
-                bar_boxes.append(bb)
-            n += 1
-    await proc.wait()
-    bar = None
-    ranges = _merge(bar_t, min_len=0.5) if len(bar_t) >= 5 else []
-    if ranges:
-        k = w / SWL
-        x0, y0, x1, y1 = (int(np.median([b[j] for b in bar_boxes]) * k) for j in range(4))
-        pad = 5
-        x0, y0 = max(x0 - pad, 0), max(y0 - pad, 0)
-        x1, y1 = min(x1 + pad, w), min(y1 + pad, h)
-        bar = (ranges, (x0, y0, (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2))
-    return {"raw": raw_path, "n": n, "sh": sh, "bar": bar}
+            yield i / fps, np.frombuffer(data, np.uint8).reshape(gh, gw, 3)
+            i += 1
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
 
 
-def _erode(m):
-    e = m.copy()
-    e[1:-1, 1:-1] = m[1:-1, 1:-1] & m[:-2, 1:-1] & m[2:, 1:-1] & m[1:-1, :-2] & m[1:-1, 2:]
-    e[0, :] = e[-1, :] = False
-    e[:, 0] = e[:, -1] = False
+def _erode(d):
+    e = np.zeros_like(d)
+    e[1:-1, 1:-1] = d[1:-1, 1:-1] & d[:-2, 1:-1] & d[2:, 1:-1] & d[1:-1, :-2] & d[1:-1, 2:]
     return e
 
 
-async def _generic_ranges(low: dict, rest):
-    """'Dam olish' rasmidan farq qiladigan yuqori qatlam (raqamlar, belgilar) bo'lgan vaqt oraliqlari."""
-    sh, n = low["sh"], low["n"]
-    fs = sh * SWL * 3
-    n_real = os.path.getsize(low["raw"]) // fs
-    n = min(n, n_real)
-    if rest is None or n < 10:
-        return None
-    p0 = await asyncio.create_subprocess_exec(
-        FFMPEG, "-v", "error", "-i", rest[1], "-vf", f"scale={SWL}:{sh}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    raw, _ = await p0.communicate()
-    if len(raw) != SWL * sh * 3:
-        return None
-    rs = np.frombuffer(raw, np.uint8).reshape(sh, SWL, 3).astype(np.int16)
-    mm = np.memmap(low["raw"], dtype=np.uint8, mode="r", shape=(n, sh, SWL, 3))
-    cw = SWL // 4
-    times = []
+def _seg_of(t, tb):
+    for c in range(4):
+        if tb[c] <= t < tb[c + 1]:
+            return c
+    return 3
+
+
+def _in_margin(t, c, tb):
+    return t - tb[c] < MARGIN or tb[c + 1] - t < MARGIN
+
+
+async def _static_refs(path, gw, gh, tb):
+    """Har segment uchun muzlagan (o'ynamayotgan) panellarning toza ko'rinishi: kadrlar medianasi.
+    Overlay faqat qisqa vaqt chiqgani uchun median uni yo'qotadi."""
+    pw = gw // 4
+    refs, cur, buf = {}, None, []
+
+    def flush():
+        if cur is not None and len(buf) >= 3:
+            refs[cur] = {p: np.median(np.stack([f[:, p * pw:(p + 1) * pw] for f in buf]), axis=0).astype(np.int16)
+                         for p in range(4) if p != cur}
+
+    async for t, fr in _frames(path, 2, gw, gh):
+        c = _seg_of(t, tb)
+        if c != cur:
+            flush()
+            cur, buf = c, []
+        if not _in_margin(t, c, tb):
+            buf.append(fr.copy())
+    flush()
+    return refs
+
+
+async def _write_mask_video(path, masks, n, gw, gh):
+    """masks: {kadr indeksi: bool (gh,gw)}. 10 fps, qora (0) = overlay yo'q."""
+    proc = await asyncio.create_subprocess_exec(
+        FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{gw}x{gh}", "-framerate", "10",
+        "-i", "-", "-c:v", "ffv1", "-pix_fmt", "gray", path,
+        stdin=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    zero = bytes(gw * gh)
     for i in range(n):
-        fl = _erode(np.abs(mm[i].astype(np.int16) - rs).max(axis=2) > DIFF_T)
-        fr_c = [fl[:, c * cw:(c + 1) * cw].mean() for c in range(4)]
-        use = [c for c in range(4) if fr_c[c] < 0.3]              # katta farq: bu panel o'ynayapti
-        area = sum(fl[:, c * cw:(c + 1) * cw].sum() for c in use) / (SWL * sh)
-        if len(use) >= 3 and 0.002 <= area <= 0.25:
-            times.append(i / 10)
-    del mm
-    return _merge(times) or None
+        m = masks.get(i)
+        if m is None:
+            proc.stdin.write(zero)
+        else:
+            im = Image.fromarray((m * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(5))   # biroz kengaytiramiz
+            proc.stdin.write(im.tobytes())
+        if i % 50 == 0:
+            await proc.stdin.drain()
+    proc.stdin.close()
+    await proc.wait()
+    return proc.returncode == 0
 
 
-def _mask_png(path: str, bw: int, bh: int):
-    m = Image.new("L", (bw, bh), 0)
-    ImageDraw.Draw(m).rounded_rectangle((0, 0, bw - 1, bh - 1), radius=int(0.2 * bh), fill=255)
-    m.save(path)
+async def _overlay(path: str, w: int, h: int, bounds, dur: float, tmp: str):
+    """Videoga qo'yilgan overlay'lar (Subscribe, belgilar, yozuvlar va h.k.) — panellarning bir qismi emas.
+    Qaytaradi: (niqob videosi yo'li, [(boshlanish, tugash), ...]) yoki None.
+    Usul: ketma-ket o'ynashda har segmentda qolgan 3 panel "muzlagan" bo'ladi; ularning toza ko'rinishidan
+    (median) har qanday og'ish — overlay. Qo'shimcha: katta oq panel (Subscribe) alohida aniqlanadi."""
+    gw = GW
+    gh = max(8, round(gw * h / w) // 2 * 2)
+    pw = gw // 4
+    tb = [b / FPS for b in bounds] if bounds else None
+    if tb:
+        tb[-1] = dur
+    refs = await _static_refs(path, gw, gh, tb) if tb else {}
+    min_px = 0.002 * gw * gh
+    flagged = {}                                   # kadr -> (maska, o'ynayotgan panel yoki None)
+    nframes = 0
+    async for t, fr in _frames(path, 10, gw, gh):
+        nframes += 1
+        i = nframes - 1
+        m = np.zeros((gh, gw), bool)
+        c = None
+        if tb:
+            c = _seg_of(t, tb)
+            if c in refs and not _in_margin(t, c, tb):
+                for p in range(4):
+                    if p == c:
+                        continue
+                    d = (np.abs(fr[:, p * pw:(p + 1) * pw].astype(np.int16) - refs[c][p]).max(axis=-1) > DIFF_THR)
+                    d = _erode(d)
+                    if d.mean() < 0.4:             # panel muzlamagan bo'lsa, ishonib bo'lmaydi
+                        m[:, p * pw:(p + 1) * pw] |= d
+        bb = _bar_bbox(fr)
+        if bb:
+            x0, y0, x1, y1 = bb
+            m[max(y0 - 1, 0):y1 + 1, max(x0 - 1, 0):x1 + 1] = True
+        if m.sum() >= min_px and len(flagged) < 6000:
+            flagged[i] = (m, c)
+    if not flagged:
+        return None
+    # --- hodisalar: ketma-ket belgilangan kadrlar
+    idx = sorted(flagged)
+    events, cur = [], [idx[0]]
+    for i in idx[1:]:
+        if i - cur[-1] <= EV_GAP:
+            cur.append(i)
+        else:
+            events.append(cur)
+            cur = [i]
+    events.append(cur)
+    events = [e for e in events if len(e) >= 3]
+    if not events:
+        return None
+
+    def bbox(m):
+        ys, xs = np.where(m)
+        return xs.min(), ys.min(), xs.max(), ys.max()
+
+    unions = [np.logical_or.reduce([flagged[i][0] for i in e]) for e in events]
+    # --- bir joydagi hodisalarni birlashtiramiz (har xil panellar muzlaganda overlay'ning turli bo'lagi ko'rinadi)
+    groups = [[k] for k in range(len(events))]
+    boxes = [bbox(u) for u in unions]
+
+    def touch(a, b):
+        return not (a[2] + 4 < b[0] or b[2] + 4 < a[0] or a[3] + 4 < b[1] or b[3] + 4 < a[1])
+
+    changed = True
+    while changed:
+        changed = False
+        for x in range(len(groups)):
+            for y in range(x + 1, len(groups)):
+                bx = [min(boxes[k][0] for k in groups[x]), min(boxes[k][1] for k in groups[x]),
+                      max(boxes[k][2] for k in groups[x]), max(boxes[k][3] for k in groups[x])]
+                by = [min(boxes[k][0] for k in groups[y]), min(boxes[k][1] for k in groups[y]),
+                      max(boxes[k][2] for k in groups[y]), max(boxes[k][3] for k in groups[y])]
+                if touch(bx, by):
+                    groups[x] += groups.pop(y)
+                    changed = True
+                    break
+            if changed:
+                break
+    masks, ranges, clusters = {}, [], []
+    for g in groups:
+        U = np.logical_or.reduce([unions[k] for k in g])
+        if U.mean() > 0.3:                          # juda katta — overlay emas, panelning o'zi o'zgargan
+            continue
+        for k in g:
+            e = events[k]
+            last = None
+            for i in range(max(e[0] - 1, 0), min(e[-1] + 2, nframes)):
+                if i in flagged:
+                    m, c = flagged[i]
+                    last = m.copy()
+                    if c is not None:              # o'ynayotgan panel ostidagi qismini boshqa hodisalardan to'ldiramiz
+                        last[:, c * pw:(c + 1) * pw] |= U[:, c * pw:(c + 1) * pw]
+                if last is not None:
+                    masks[i] = last
+            ranges.append((max(e[0] / 10 - 0.15, 0.0), e[-1] / 10 + 0.25))
+        kx, ky = w / gw, h / gh
+        x0, y0, x1, y1 = bbox(U)
+        clusters.append(((int(x0 * kx), int(y0 * ky), int((x1 + 1) * kx), int((y1 + 1) * ky)),
+                         [(max(events[k][0] / 10 - 0.15, 0.0), events[k][-1] / 10 + 0.25) for k in g]))
+    if not masks:
+        return None
+    out = os.path.join(tmp, "ovmask.mkv")
+    if not await _write_mask_video(out, masks, nframes, gw, gh):
+        return None
+    return out, ranges, clusters
 
 
-# ---------- O'ynash tartibi ----------
-def find_segments(m: np.ndarray, strict: bool = True):
-    """Ketma-ket o'ynash chegaralarini topadi: 1-panel, keyin 2-, 3-, 4-panel (kadr indekslari).
-    strict=False — kuchsiz/qisqa o'ynashlarda ham urinib ko'radi."""
-    spike_thr = 25 if strict else 16
-    min_len = FPS if strict else int(0.6 * FPS)
-    ratio = 1.8 if strict else 1.35
-    own_min = 0.004 if strict else 0.0025
+def find_segments(m: np.ndarray):
+    """Ketma-ket o'ynash chegaralarini topadi: 1-panel, keyin 2-, 3-, 4-panel (kadr indekslari)."""
     n = len(m)
     p = np.vstack([np.zeros((1, 4), dtype=np.float64), np.cumsum(m, axis=0, dtype=np.float64)])
     neg = -1e18
@@ -250,270 +297,213 @@ def find_segments(m: np.ndarray, strict: bool = True):
         lo, hi = max(bounds[c] - 60, 0), min(bounds[c] + 60, n - 1)
         sc = m[lo:hi, c - 1] + m[lo:hi, c]                 # almashish kadrida ikki panel ham keskin o'zgaradi
         t = int(np.argmax(sc))
-        if sc[t] > spike_thr and m[lo + t, c - 1] > 10 and m[lo + t, c] > 10:
+        if sc[t] > 25 and m[lo + t, c - 1] > 10 and m[lo + t, c] > 10:
             bounds[c] = lo + t + 1
     if not (0 < bounds[1] < bounds[2] < bounds[3] < n):
-        raise NotSequential("panel chegaralari topilmadi")
+        raise NotSequential()
     for c in range(4):
         a, b = bounds[c], bounds[c + 1]
-        if b - a < min_len:
-            raise NotSequential(f"{c + 1}-panel oynasi juda qisqa ({(b - a) / FPS:.1f} s)")
+        if b - a < FPS:                                   # 1 soniyadan qisqa bo'lak
+            raise NotSequential()
         own = m[a:b, c].mean()
         others = np.delete(m[a:b], c, axis=1).mean()
-        if own < ratio * others or own < own_min:
-            raise NotSequential(f"{c + 1}-panel farqi yetarli emas (own={own:.4f})")
+        if own < 1.8 * others or own < 0.004:             # shu panel boshqalardan aniq faol emas
+            raise NotSequential()
     return bounds
 
 
-def trim_edges(m: np.ndarray, bounds: list, spike_thr: int = 25):
-    """Boshidagi (hamma panel to'xtab, 3-2-1 sanash) va oxiridagi qismlarni topadi: (i0, o0) kadr indekslari."""
-    def spike(c, a, b, first):
-        seg = m[a:b, c]
-        n = len(seg)
-        lo, hi = (0, int(n * 0.7)) if first else (int(n * 0.3), n)
-        if hi - lo < 5:
-            return None
-        k = lo + int(np.argmax(seg[lo:hi]))
-        return a + k + 1 if seg[k] > spike_thr else None
-
-    def sustained(c, a, b, first):
-        seg = m[a:b, c]
-        if len(seg) < 30:
-            return a if first else b
-        med = np.median(np.lib.stride_tricks.sliding_window_view(seg, 15), axis=1)
-        idx = np.nonzero(med > 0.3 * np.percentile(seg, 75))[0]
-        if not len(idx):
-            return a if first else b
-        return a + int(idx[0]) + 7 if first else a + int(idx[-1]) + 8
-
-    i0 = spike(0, bounds[0], bounds[1], True)
-    if i0 is None:
-        i0 = sustained(0, bounds[0], bounds[1], True)
-    o0 = spike(3, bounds[3], bounds[4], False)
-    if o0 is None:
-        o0 = sustained(3, bounds[3], bounds[4], False)
-    return i0, min(o0, bounds[4])
-
-
-# ---------- ffmpeg ----------
-async def _encode(args_in, filt, out, vb, audio):
+async def _encode(args_in, filt, out, vb, audio, dur):
     args = ["-y"] + args_in + ["-filter_complex", filt, "-map", "[v]"]
     if audio:
         args += ["-map", "0:a:0?", "-af", "aresample=44100,aformat=channel_layouts=stereo",
                  "-c:a", "aac", "-b:a", "128k"]
     args += ["-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-r", str(FPS),
              "-b:v", f"{vb}k", "-maxrate", f"{int(vb * 1.4)}k", "-bufsize", f"{vb * 2}k",
-             "-g", "60", "-keyint_min", "60", "-sc_threshold", "0", "-pix_fmt", "yuv420p", out]
+             "-g", "60", "-keyint_min", "60", "-sc_threshold", "0", "-pix_fmt", "yuv420p",
+             "-t", f"{dur:.3f}", out]
     rc, err = await _run(args)
     if rc != 0:
         raise RuntimeError("ffmpeg xatosi: " + err[-500:])
 
 
-def _local(ranges, t0, d):
-    out = []
-    for a, b in ranges:
-        lo, hi = max(a, t0), min(b, t0 + d)
-        if hi > lo:
-            out.append((lo - t0, hi - t0))
-    return out
-
-
-def _en(ranges):
-    return "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in ranges)
-
-
-def _diff_mask(src_label, rest_label, boxes, cw, tag):
-    """Asl kadr va 'dam olish' rasmi farqidan yuqori qatlam maskasi (o'ynayotgan panel chiqarib tashlanadi)."""
-    parts = [f"[{src_label}][{rest_label}]blend=all_mode=difference[{tag}0]"]
-    last = f"{tag}0"
-    for j, (px, a, b) in enumerate(boxes):
-        parts.append(f"[{last}]drawbox=x={px}:y=0:w={cw}:h=ih:color=black:t=fill:"
-                     f"enable='between(t,{a:.3f},{b:.3f})'[{tag}{j + 1}]")
-        last = f"{tag}{j + 1}"
-    parts.append(f"[{last}]format=gray,lut=y='if(gt(val,{DIFF_T - 12}),255,0)',erosion,dilation,dilation,dilation[{tag}m]")
-    return parts, f"{tag}m"
-
-
-def _filter(order, cw, ph, src_i=None, bar=None, bar_i=None, gen=None, clean=None, rest_i=None):
-    """Panellar tartibi o'zgaradi.
-    clean = (asl vaqt oraliqlari, qutilar): asl kadrdagi yuqori qatlam 'dam olish' rasmi bilan tozalanadi
-            (aks holda u panel bilan birga siljib ketadi);
-    gen   = (chiqish vaqti oraliqlari, qutilar): yuqori qatlam o'z joyiga o'sha vaqtdan qaytariladi (src_i — asl video);
-    bar   = (oraliqlar, (x,y,eni,bo'yi)): oq Subscribe paneli."""
-    parts = []
-    n_rest = (2 if clean else 0) + (1 if gen else 0)
-    labels = [f"rs{k}" for k in range(n_rest)]
-    if n_rest:
-        parts.append(f"[{rest_i}:v]format=rgb24,split={n_rest}" + "".join(f"[{x}]" for x in labels)
-                     if n_rest > 1 else f"[{rest_i}:v]format=rgb24[rs0]")
-    content = "0:v"
+def _filter(order, cw, h, old, apply=None, clean=None, dlogo=()):
+    """order[k] = k-o'rindagi panelning eski indeksi; old = shu qismda o'ynayotgan eski panel.
+    clean = (ref_kirish, niqob_kirish): panellardan overlay olib tashlanadi (muzlaganlar — toza rasm bilan,
+        o'ynayotgani — xira parcha bilan); niqob ASL vaqt bo'yicha.
+    apply = (video_kirish, niqob_kirish): overlay asl joyida va asl vaqtida asl videodan qayta qo'yiladi."""
+    w4 = 4 * cw
+    parts = ["[0:v]split=4" + "".join(f"[a{i}]" for i in range(4))]
+    frozen = [q for q in range(4) if q != old]
     if clean:
-        ranges, boxes = clean
-        parts.append("[0:v]format=rgb24,split[k1][k2]")
-        pp, ml = _diff_mask("k2", labels.pop(0), boxes, cw, "kd")
-        parts += pp
-        parts.append(f"[{labels.pop(0)}]format=rgba[rp]")
-        parts.append(f"[rp][{ml}]alphamerge[rpatch]")
-        parts.append(f"[k1][rpatch]overlay=0:0:enable='{_en(ranges)}'[cv]")
-        content = "cv"
-    parts.append(f"[{content}]split=4" + "".join(f"[a{i}]" for i in range(4)))
-    for c, old in enumerate(order):
-        parts.append(f"[a{c}]crop={cw}:{ph}:{old * cw}:0[c{c}]")
-    parts.append("".join(f"[c{c}]" for c in range(4)) + "hstack=inputs=4[base]")
-    cur = "base"
-    n_br = (1 if bar else 0) + (1 if gen else 0)
-    if n_br:
-        parts.append(f"[{src_i}:v]split={n_br}" + "".join(f"[s{k}]" for k in range(n_br))
-                     if n_br > 1 else f"[{src_i}:v]null[s0]")
-    k = 0
-    if bar:
-        ranges, (x, y, bw, bh) = bar
-        parts.append(f"[s{k}]crop={bw}:{bh}:{x}:{y},format=rgba[bc]")
-        parts.append(f"[{bar_i}:v]format=gray[bm]")
-        parts.append("[bc][bm]alphamerge[bova]")
-        parts.append(f"[{cur}][bova]overlay={x}:{y}:enable='{_en(ranges)}'[o1]")
-        cur = "o1"
-        k += 1
-    if gen:
-        ranges, boxes = gen
-        parts.append(f"[s{k}]format=rgb24,split[g1][g2]")
-        pp, ml = _diff_mask("g2", labels.pop(0), boxes, cw, "gd")
-        parts += pp
-        parts.append("[g1]format=rgba[gc]")
-        parts.append(f"[gc][{ml}]alphamerge[gova]")
-        parts.append(f"[{cur}][gova]overlay=0:0:enable='{_en(ranges)}'[o2]")
-        cur = "o2"
-    parts.append(f"[{cur}]null[v]")
+        ir, im = clean
+        parts.append(f"[{im}:v]fps={FPS},scale={w4}:{h}:flags=bilinear,format=gray,boxblur=2:1,split=3"
+                     + "".join(f"[cm{q}]" for q in frozen))
+        parts.append(f"[{ir}:v]format=rgba,split=3" + "".join(f"[rf{q}]" for q in frozen))
+    for k, q in enumerate(order):
+        if not clean:
+            parts.append(f"[a{q}]crop={cw}:{h}:{q * cw}:0[c{k}]")
+            continue
+        parts.append(f"[a{q}]crop={cw}:{h}:{q * cw}:0[r{k}]")
+        if q != old:
+            parts.append(f"[cm{q}]crop={cw}:{h}:{q * cw}:0[cmc{q}]")
+            parts.append(f"[rf{q}]crop={cw}:{h}:{q * cw}:0[rc{q}]")
+            parts.append(f"[rc{q}][cmc{q}]alphamerge[rm{q}]")
+            parts.append(f"[r{k}][rm{q}]overlay=0:0:format=auto[c{k}]")
+        else:
+            # o'ynayotgan panel: toza kadr yo'q, shuning uchun overlay joyi atrofdan to'ldiriladi (delogo)
+            chain = ",".join(
+                f"delogo=x={x}:y={y}:w={bw}:h={bh}:enable='" + "+".join(f"between(t,{p:.3f},{q2:.3f})" for p, q2 in rg) + "'"
+                for x, y, bw, bh, rg in dlogo) or "null"
+            parts.append(f"[r{k}]{chain}[c{k}]")
+    last = "base" if apply else "v"
+    parts.append("".join(f"[c{k}]" for k in range(4)) + f"hstack=inputs=4[{last}]")
+    if apply:
+        iv, im = apply
+        parts.append(f"[{iv}:v]crop={w4}:{h}:0:0,format=rgba[ovc]")
+        parts.append(f"[{im}:v]fps={FPS},scale={w4}:{h}:flags=bilinear,format=gray,boxblur=2:1[msk]")
+        parts.append("[ovc][msk]alphamerge[ova]")
+        parts.append("[base][ova]overlay=0:0:format=auto[v]")
     return ";".join(parts)
 
 
-def _rest_panels(rest_arr, order, cw, ph, tmp):
-    """Prevyu uchun: har bir YANGI o'ringa mos panelning 'dam olish' tasvirini kesib saqlaydi."""
-    paths = []
-    for j, old in enumerate(order):
-        col = Image.fromarray(rest_arr[:, old * cw:(old + 1) * cw].copy()).resize((cw, ph), Image.LANCZOS)
-        p = os.path.join(tmp, f"rp{j}.png")
-        col.save(p)
-        paths.append(p)
-    return paths
+def _local_ranges(ranges, t0, d):
+    return [(max(a, t0), min(b, t0 + d)) for a, b in ranges if min(b, t0 + d) > max(a, t0)]
+
+
+async def _clean_refs(video, tb, ranges, cw, ph, tmp, need):
+    """need: toza rasm kerak bo'lgan segmentlar (eski panel indekslari). Har biri uchun to'liq o'lchamli
+    rasm yasaydi: o'sha segmentda muzlagan panellarning median kadri (overlay yo'q paytdagi kadrlardan)."""
+    out = {}
+    for c in need:
+        lo, hi = tb[c] + MARGIN, tb[c + 1] - MARGIN
+        if hi - lo < 0.5:
+            continue
+        times = [lo + (hi - lo) * (k + 0.5) / 9 for k in range(9)]
+        free = [t for t in times if not any(a - 0.2 <= t <= b + 0.2 for a, b in ranges)]
+        use = free if len(free) >= 3 else times
+        frames = []
+        for j, t in enumerate(use):
+            fp = os.path.join(tmp, f"ref{c}_{j}.png")
+            rc, _ = await _run(["-y", "-ss", f"{t:.3f}", "-i", video, "-frames:v", "1", fp], 120)
+            if rc == 0 and os.path.exists(fp):
+                frames.append(np.array(Image.open(fp).convert("RGB"))[:ph, :4 * cw])
+        if not frames:
+            continue
+        med = np.median(np.stack(frames), axis=0).astype(np.uint8) if len(frames) > 1 else frames[0]
+        rp = os.path.join(tmp, f"clean{c}.png")
+        Image.fromarray(med).save(rp)
+        out[c] = rp
+    return out
+
+
+async def _heroes(video, w, h, cw, tb, dur, order, tmp):
+    """Panellarda to'xtab turgan personaj rasmlarini kesib oladi (prevyu uchun), YANGI tartibda.
+    Panel o'ynamayotgan paytdagi kadrlardan olinadi; bir nechta kadr medianasi overlay'larni yo'qotadi.
+    Qaytaradi: 4 ta RGBA (PIL) yoki []."""
+    if tb:
+        times = [(tb[s] + tb[s + 1]) / 2 for s in range(4)]
+    else:
+        times = [dur * (k + 0.5) / 4 for k in range(4)]
+    frames = []
+    for j, t in enumerate(times):
+        fp = os.path.join(tmp, f"hf{j}.png")
+        rc, _ = await _run(["-y", "-ss", f"{t:.3f}", "-i", video, "-frames:v", "1", fp], 120)
+        frames.append(np.array(Image.open(fp).convert("RGB")) if rc == 0 and os.path.exists(fp) else None)
+    panels = []
+    for p in range(4):
+        use = [f[:, p * cw:(p + 1) * cw] for s, f in enumerate(frames) if f is not None and (not tb or s != p)]
+        if not use:
+            return []
+        panels.append(np.median(np.stack(use), axis=0).astype(np.uint8) if len(use) > 1 else use[0])
+    cuts = await asyncio.to_thread(heroes_mod.cutouts, panels)
+    out = []
+    for p in order:
+        c = cuts[p]
+        out.append(c if c is not None else Image.fromarray(panels[p]).convert("RGBA"))
+    return out
 
 
 async def build(video: str, order: list, out: str, tmp: str, progress=None):
     """order[j] = yangi j-o'rindagi panelning eski indeksi (0..3).
-    Qaytaradi: {"total": soniya, "ordered": ketma-ketmi, "panels": [prevyu uchun 4 ta rasm],
-                "diag": {...tahlil natijalari}}"""
+    Qaytaradi: {"total": soniya, "ordered": ketma-ketmi, "heroes": [prevyu uchun 4 ta RGBA personaj]}"""
     w, h, dur, has_audio = await _probe(video)
     if dur > MAX_SEC:
         raise ValueError(f"Video juda uzun (eng ko'pi {MAX_SEC // 60} daqiqa).")
     cw = (w // 4) // 2 * 2
     ph = h // 2 * 2
     vb = int(min(5000, max(300, render.TARGET_MB * 8192 / dur - 128)))
-    diag = {"sequential": True, "bar": None, "gen": None, "reason": ""}
     if progress:
-        await progress("🔎 Panellar, Subscribe va raqamlar (yuqori qatlam) aniqlanmoqda...")
-    low_res, mo_res = await asyncio.gather(_lowres(video, w, h, tmp), _motion(video), return_exceptions=True)
-    if isinstance(mo_res, Exception):
-        raise mo_res
-    bar_info = None if isinstance(low_res, Exception) else low_res["bar"]
-    diag["bar"] = bar_info[0] if bar_info else None
-    bar_mask = os.path.join(tmp, "ovmask.png")
-    if bar_info:
-        _mask_png(bar_mask, bar_info[1][2], bar_info[1][3])
-    sequential = True
+        await progress("🔎 Panellar va o'ynash tartibi aniqlanmoqda...")
+    mo_res = await _motion(video)
     bounds = None
     try:
-        bounds = find_segments(mo_res, strict=True)
-    except NotSequential as e:
-        try:
-            bounds = find_segments(mo_res, strict=False)
-            diag["reason"] = f"kuchsiz signal ({e})"
-        except NotSequential as e2:
-            sequential = False
-            diag["sequential"] = False
-            diag["reason"] = str(e2)
-    log.info("swap tahlil: sequential=%s reason=%s bar=%s", sequential, diag["reason"], diag["bar"])
-    rest, gen_ranges = None, None
-    if sequential and not isinstance(low_res, Exception):
-        try:
-            i0t, o0t = trim_edges(mo_res, bounds)
-            ftt = [b / FPS for b in bounds]
-            ftt[0], ftt[4] = i0t / FPS, o0t / FPS
-            active = [(ftt[c], ftt[c + 1]) for c in range(4)]
-            avoid = bar_info[0] if bar_info else []
-            rest = await _rest_image(video, w, dur, tmp, active, avoid)
-            gen_ranges = await _generic_ranges(low_res, rest)
-        except Exception:
-            log.exception("yuqori qatlam tahlili xatosi")
-            rest, gen_ranges = None, None
-    diag["gen"] = gen_ranges
-    log.info("swap tahlil: gen=%s", gen_ranges)
-    scan = {"bar": bar_info, "gen": gen_ranges}
+        bounds = find_segments(mo_res)
+    except NotSequential:
+        pass
+    if progress:
+        await progress("🔎 Subscribe va panellar ustidagi boshqa narsalar aniqlanmoqda...")
+    try:
+        ov = await _overlay(video, w, h, bounds, dur, tmp)
+    except Exception:
+        ov = None
 
-    def build_inputs(content_args, s0, t0, d, gen_boxes):
-        """Kirishlar va filtr. s0 — asl videodagi boshlanish, t0 — tayyor videodagi boshlanish."""
-        bar_lr = _local(scan["bar"][0], t0, d) if scan["bar"] else []
-        use_gen = bool(scan["gen"] and rest is not None and gen_boxes is not None)
-        gen_lr = _local(scan["gen"], t0, d) if use_gen else []
-        clean_lr = _local(scan["gen"], s0, d) if use_gen else []
-        if not (bar_lr or gen_lr or clean_lr):
-            return content_args, _filter(order, cw, ph)
-        args = list(content_args)
-        idx = 1
-        src_i = bar_i = rest_i = None
-        if bar_lr or gen_lr:
-            args += ["-ss", f"{t0:.3f}", "-t", f"{d:.3f}", "-i", video]
-            src_i, idx = idx, idx + 1
-        if bar_lr:
-            args += ["-loop", "1", "-framerate", str(FPS), "-t", f"{d:.3f}", "-i", bar_mask]
-            bar_i, idx = idx, idx + 1
-        if gen_lr or clean_lr:
-            args += ["-loop", "1", "-framerate", str(FPS), "-t", f"{d:.3f}", "-i", rest[1]]
-            rest_i, idx = idx, idx + 1
+    def delogos(s0, d, old):
+        """O'ynayotgan panel ustidagi overlay joylari: [(x, y, eni, bo'yi, [(a, b)...])] (panel koordinatalarida)."""
+        res = []
+        for (x0, y0, x1, y1), rg in ov[2]:
+            lr = _local_ranges(rg, s0, d)
+            lx0, lx1 = max(x0, old * cw), min(x1, (old + 1) * cw)
+            if not lr or lx1 <= lx0:
+                continue
+            px0, px1 = max(lx0 - old * cw - 4, 1), min(lx1 - old * cw + 4, cw - 2)
+            py0, py1 = max(y0 - 4, 1), min(y1 + 4, ph - 2)
+            if px1 - px0 > 2 and py1 - py0 > 2:
+                res.append((px0, py0, px1 - px0, py1 - py0, [(p - s0, q - s0) for p, q in lr]))
+        return res
 
-        def boxes_at(t_start):
-            return [(c * cw, max(a - t_start, 0.0), min(b - t_start, d)) for c, a, b in gen_boxes
-                    if b - t_start > 0 and a - t_start < d]
-        flt = _filter(order, cw, ph, src_i=src_i,
-                      bar=(bar_lr, scan["bar"][1]) if bar_lr else None, bar_i=bar_i,
-                      gen=(gen_lr, boxes_at(t0)) if gen_lr else None,
-                      clean=(clean_lr, boxes_at(s0)) if clean_lr else None, rest_i=rest_i)
-        return args, flt
+    def inputs(main_args, t0, d, s0=None, old=None):
+        """(kirishlar, apply, clean): s0/old berilsa (ketma-ket rejim), overlay asl panel kadrlaridan ham tozalanadi."""
+        args, apply, clean = list(main_args), None, None
+        n = 1
+        if ov and _local_ranges(ov[1], t0, d):
+            args += ["-ss", f"{t0:.3f}", "-t", f"{d:.3f}", "-i", video,
+                     "-ss", f"{t0:.3f}", "-t", f"{d:.3f}", "-i", ov[0]]
+            apply = (n, n + 1)
+            n += 2
+        if ov and s0 is not None and old in clean_refs and _local_ranges(ov[1], s0, d):
+            args += ["-loop", "1", "-framerate", str(FPS), "-t", f"{d:.3f}", "-i", clean_refs[old],
+                     "-ss", f"{s0:.3f}", "-t", f"{d:.3f}", "-i", ov[0]]
+            clean = (n, n + 1)
+        return args, apply, clean
 
-    if not sequential:
+    tb = None
+    if bounds:
+        tb = [b / FPS for b in bounds]
+        tb[-1] = dur
+    if not bounds:
         if progress:
-            await progress("🎬 Panellar joyi almashtirilmoqda (yuqori qatlam saqlanmadi, "
-                           "videoda ketma-ket o'ynash topilmadi)...")
-        args, flt = build_inputs(["-i", video], 0.0, 0.0, dur, None)
-        await _encode(args, flt, out, vb, has_audio)
-        times = [max(dur - 1.5, 0) + i * 0.2 for i in range(6)]
-        r2 = await _rest_image(video, w, dur, tmp, [(0, 0)] * 4,
-                               bar_info[0] if bar_info else [], times=times)
-        panels = _rest_panels(r2[0], order, cw, ph, tmp) if r2 else []
-        return {"total": dur, "ordered": False, "panels": panels, "diag": diag}
-
-    i0, o0 = trim_edges(mo_res, bounds)
-    ft = [b / FPS for b in bounds]
-    ft[0], ft[4] = i0 / FPS, o0 / FPS                       # o'ynash boshlanishi va tugashi
-    margin = 0.15
-    gen_boxes = [(c, ft[c] - margin, ft[c + 1] + margin) for c in range(4)]
-    plan = []                                              # (nom, manba boshi, manba oxiri)
-    if i0 / FPS >= 0.5:
-        plan.append(("intro", 0.0, i0 / FPS))
+            await progress("🎬 Panellar joyi almashtirilmoqda...")
+        args, apply, _ = inputs(["-i", video], 0.0, dur)
+        await _encode(args, _filter(order, cw, ph, -1, apply), out, vb, has_audio, dur)
+        return {"total": dur, "ordered": False,
+                "heroes": await _heroes(video, w, h, cw, None, dur, order, tmp)}
+    clean_refs = {}
+    if ov:
+        if progress:
+            await progress("🧹 Panellar ustidagi narsalar tozalanmoqda...")
+        need = [c for c in range(4) if _local_ranges(ov[1], tb[c], tb[c + 1] - tb[c])]
+        clean_refs = await _clean_refs(video, tb, ov[1], cw, ph, tmp, need)
+    segs, t0 = [], 0.0
     for j, old in enumerate(order):
-        plan.append((f"play{j}", ft[old], ft[old + 1]))
-    if dur - o0 / FPS >= 0.5:
-        plan.append(("outro", o0 / FPS, dur))
-    segs, t0, play_mid = [], 0.0, []
-    for k, (name, s0, e0) in enumerate(plan):
         if progress:
-            await progress(f"🎬 {k + 1}-qism tayyorlanmoqda ({k + 1}/{len(plan)})...")
+            await progress(f"🎬 {j + 1}-qism tayyorlanmoqda ({j + 1}/4)...")
+        s0, e0 = tb[old], tb[old + 1]
         d = e0 - s0
-        seg = os.path.join(tmp, f"sw{k}.mp4")
-        args, flt = build_inputs(["-ss", f"{s0:.3f}", "-t", f"{d:.3f}", "-i", video], s0, t0, d, gen_boxes)
-        await _encode(args, flt, seg, vb, has_audio)
+        seg = os.path.join(tmp, f"sw{j}.mp4")
+        args, apply, clean = inputs(["-ss", f"{s0:.3f}", "-t", f"{d:.3f}", "-i", video], t0, d, s0, old)
+        dl = delogos(s0, d, old) if clean else ()
+        await _encode(args, _filter(order, cw, ph, old, apply, clean, dl), seg, vb, has_audio, d)
         segs.append(seg)
-        if name.startswith("play"):
-            play_mid.append(t0 + d / 2)
         t0 += d
     if progress:
         await progress("🔗 Qismlar birlashtirilmoqda...")
@@ -526,5 +516,5 @@ async def build(video: str, order: list, out: str, tmp: str, progress=None):
         raise RuntimeError("ffmpeg birlashtirish xatosi: " + err[-500:])
     if os.path.getsize(out) > 49 * 1024 * 1024:
         raise RuntimeError("Video hajmi 50 MB dan oshib ketdi")
-    panels = _rest_panels(rest[0], order, cw, ph, tmp) if rest is not None else []
-    return {"total": dur, "ordered": True, "panels": panels, "diag": diag}
+    return {"total": dur, "ordered": True,
+            "heroes": await _heroes(video, w, h, cw, tb, dur, order, tmp)}

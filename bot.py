@@ -13,7 +13,6 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import aiosqlite
-from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -75,19 +74,6 @@ def spawn(coro):
     task = asyncio.create_task(coro)
     BG.add(task)
     task.add_done_callback(BG.discard)
-
-
-async def health(request):
-    return web.Response(text="OK")
-
-
-async def start_web():
-    app = web.Application()
-    app.router.add_get("/", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    await web.TCPSite(runner, "0.0.0.0", port).start()
 
 
 # ---------- Tugmalar ----------
@@ -666,7 +652,8 @@ async def start_order(m: Message, state: FSMContext, direction: str):
         d = {"kind": "swap", "direction": direction, "video": None, "order": None}
         text = ("🔀 Video joyini almashtirish\n\nTiles Hop videosini yuboring (4 ta panelli tayyor video). "
                 "Bot personajlar joyini almashtiradi, video esa har doimgidek chap tomondagi 1-o'rindan "
-                "boshlanadi. Subscribe tugmasi kabi boshqa qismlar o'z joyida qoladi.\n\n"
+                "boshlanadi. Panellar ustidagi Subscribe tugmasi kabi narsalar o'z joyida va o'z vaqtida qoladi, "
+                "faqat panellar almashadi.\n\n"
                 "Tayyorlash: taxminan 3–8 daqiqa. Navbat kutish vaqti alohida ko'rsatiladi.\n\n" + swap_prompt(d))
     elif name == "Tiles Hop":
         d = {"kind": "tiles", "direction": direction, "imgs": [], "vids": []}
@@ -757,11 +744,10 @@ async def swap_job(bot: Bot, chat_id: int, d: dict, step):
         out = os.path.join(tmp, "swapped.mp4")
         res = await swapper.build(vp, d["order"], out, tmp, progress=step)
         preview = None
-        if len(res["frames"]) == 4:
+        if len(res["heroes"]) == 4:
             await step("🖼 Prevyu tayyorlanmoqda...")
             try:
-                heroes = [media.oval_cutout(Image.open(p)) for p in res["frames"]]
-                preview = await asyncio.to_thread(media.make_preview_imgs, heroes, "Tiles Hop")
+                preview = await asyncio.to_thread(media.make_preview_imgs, res["heroes"], "Tiles Hop")
             except Exception:
                 log.exception("Prevyu yasalmadi")
         await step("📤 Yuborilmoqda (video hajmiga qarab bir necha daqiqa ketishi mumkin)...")
@@ -1225,7 +1211,6 @@ async def fallback(m: Message):
 # ---------- Ishga tushirish ----------
 async def main():
     global BOT_USERNAME, tg_client
-    await start_web()
     await init_db()
     if TG_API_ID and TG_API_HASH:
         try:
